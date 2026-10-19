@@ -1,0 +1,147 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: >-
+    -Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g
+    -Dorg.gradle.parallel=true
+    -Dorg.gradle.caching=true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 单元测试 + 五个 ABI 变体全量编译
+  #    JRE 资源默认缺席 —— 缺失时构建必须**依然成功**，只是 APK 里没有预装 Java。
+  #    这条是硬要求：不能让「没配 Secret」变成「打不出包」。
+  # ---------------------------------------------------------------------------
+  build:
+    name: 测试与编译
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 单元测试
+        run: ./gradlew test --stacktrace
+
+      - name: 下载并打包内置 JRE（可选）
+        # 只有配了 JRE_ARCHIVES_URL 才执行；没配就跳过，APK 里不含预装 Java，
+        # 运行时会走远端清单按需下载。
+        if: ${{ vars.JRE_ARCHIVES_URL != '' }}
+        env:
+          JRE_ARCHIVES_URL: ${{ vars.JRE_ARCHIVES_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p .jre-cache
+          echo "从 $JRE_ARCHIVES_URL 下载 JRE 归档…"
+          if [[ "$JRE_ARCHIVES_URL" == *.json ]]; then
+            # 清单形式：{"files":[{"url":"...","abi":"arm64-v8a","major":21}]}
+            curl -fsSL "$JRE_ARCHIVES_URL" -o .jre-cache/index.json
+            python3 - <<'EOF'
+          import json, os, subprocess, sys
+          idx = json.load(open('.jre-cache/index.json'))
+          for f in idx.get('files', []):
+              name = f['url'].rsplit('/', 1)[-1]
+              subprocess.check_call(['curl', '-fsSL', f['url'], '-o', f'.jre-cache/{name}'])
+          EOF
+          else
+            curl -fsSL "$JRE_ARCHIVES_URL" -o .jre-cache/bundle.tar.gz
+            tar -xzf .jre-cache/bundle.tar.gz -C .jre-cache
+          fi
+          python3 scripts/package_runtimes.py \
+            --dir .jre-cache --out app/src/main/assets \
+            --manifest .jre-cache/jre-index.json
+          du -sh app/src/main/assets/runtime/* 2>/dev/null || true
+
+      - name: 编译五个 ABI 变体
+        run: |
+          ./gradlew \
+            :app:assembleArm32Release \
+            :app:assembleArm64Release \
+            :app:assembleX86Release \
+            :app:assembleX64Release \
+            :app:assembleUniversalRelease \
+            --stacktrace
+
+      - name: 重命名产物
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          for abi in arm32 arm64 x86 x64 universal; do
+            src=$(find app/build/outputs/apk/$abi/release -name '*.apk' | head -1)
+            cp "$src" "artifacts/MizuLauncher-${GITHUB_REF_NAME}-${abi}.apk"
+          done
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: artifacts/*.apk
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # 2. 打 tag 时自动建 Release，把五个 APK 挂上去
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apks
+          path: artifacts
+
+      - name: 生成校验文件
+        run: |
+          cd artifacts
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.apk
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true
+          body: |
+            ## 安装说明
+
+            按手机 CPU 架构选一个装，装错了会闪退（JRE 与原生库都是按架构编译的）：
+
+            | 文件 | 适用设备 |
+            |---|---|
+            | `-arm64.apk` | 绝大多数 2017 年后的安卓手机（推荐） |
+            | `-arm32.apk` | 老旧的 32 位 ARM 设备（无 Java 25） |
+            | `-x64.apk` | 模拟器 / x86 平板 |
+            | `-x86.apk` | 32 位 x86 模拟器（无 Java 25） |
+            | `-universal.apk` | 不确定架构时装这个（体积最大） |
+
+            不知道自己的架构？装 `universal` 最稳。

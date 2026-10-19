@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="pcl_primary">#2F7BF6</color>
+    <color name="pcl_secondary">#00C2A8</color>
+    <color name="pcl_background">#0E1013</color>
+    <color name="pcl_surface">#161A1F</color>
+</resources>
