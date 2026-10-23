@@ -6,6 +6,7 @@ import com.mizulauncher.bridge.LaunchResult
 import com.mizulauncher.bridge.LauncherBridge
 import com.mizulauncher.download.DownloadEngine
 import com.mizulauncher.download.DownloadTask
+import com.mizulauncher.auth.toAccount
 import com.mizulauncher.instance.Account
 import com.mizulauncher.instance.ArgumentBuilder
 import com.mizulauncher.instance.InstanceMeta
@@ -183,7 +184,9 @@ class LaunchOrchestrator(context: Context) {
             downloadEngine.run(unique, "下载游戏文件").getOrThrow()
 
             stage("生成启动参数")
-            val account = Account(container.settings.lastAccount)
+            // 有正版档案就用正版身份，否则退回离线模式（名字取设置里的）
+            val account = resolveAccount()
+            pendingAccount = account
             val request = ArgumentBuilder.build(
                 versionId = meta.versionId,
                 merged = merged,
@@ -214,7 +217,18 @@ class LaunchOrchestrator(context: Context) {
             )
         runCatching { b.ensureRuntime(request.javaMajor).getOrThrow() }
             .onFailure { return@withContext LaunchResult.Failed("下载 Java ${request.javaMajor} 运行时失败：${it.message}") }
-        b.launch(request, Account(container.settings.lastAccount), options)
+        val account = pendingAccount ?: resolveAccount()
+        b.launch(request, account, options)
+    }
+
+    /** prepare() 中解析出的账户，launch() 复用同一个，避免两次续期拿到不同令牌 */
+    @Volatile
+    private var pendingAccount: Account? = null
+
+    /** 启动时实际使用的账户。令牌过期会在这里静默续期一次 */
+    private suspend fun resolveAccount(): Account = withContext(Dispatchers.IO) {
+        container.accountSession.valid()?.toAccount()
+            ?: Account(container.settings.lastAccount)
     }
 
     /** 一步到位：装好再启动 */

@@ -33,6 +33,7 @@ import com.mizulauncher.ui.SplashContent
 import com.mizulauncher.ui.components.GlassCard
 import com.mizulauncher.ui.components.ProgressBlock
 import com.mizulauncher.ui.screens.about.AboutScreen
+import com.mizulauncher.ui.screens.account.AccountScreen
 import com.mizulauncher.ui.screens.control.ControlEditorCanvas
 import com.mizulauncher.ui.screens.control.ControlLayout
 import com.mizulauncher.ui.screens.download.DownloadScreen
@@ -111,6 +112,14 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
     val stage by vm.stage.collectAsStateWithLifecycle()
     val error by vm.error.collectAsStateWithLifecycle()
     val runtimeStates by vm.runtimeStates.collectAsStateWithLifecycle()
+    val profile by vm.profile.collectAsStateWithLifecycle()
+
+    // 启动时静默续期一次：令牌快过期就刷新，失败不打扰用户
+    LaunchedEffect(Unit) { vm.refreshAccountIfNeeded() }
+    val deviceCode by vm.deviceCode.collectAsStateWithLifecycle()
+    val authBusy by vm.authBusy.collectAsStateWithLifecycle()
+    val authStatus by vm.authStatus.collectAsStateWithLifecycle()
+    val authError by vm.authError.collectAsStateWithLifecycle()
 
     var destination by remember { mutableStateOf(MainDestination.HOME) }
     var currentSource by remember { mutableStateOf(settings.downloadSource) }
@@ -173,7 +182,7 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                 MainDestination.HOME -> HomeScreen(
                     instances = instances,
                     selected = selected,
-                    accountName = accountName,
+                    accountName = profile?.name ?: accountName,
                     columns = if (widthDp >= 840) 4 else if (widthDp >= 600) 3 else 2,
                     onSelectInstance = { vm.selectInstance(it.id) },
                     onLaunch = {
@@ -186,7 +195,7 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                         vm.selectInstance(inst.id)
                         destination = MainDestination.SETTINGS
                     },
-                    onOpenAccount = { destination = MainDestination.SETTINGS },
+                    onOpenAccount = { destination = MainDestination.ACCOUNT },
                     modifier = modifier
                 )
 
@@ -210,6 +219,23 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                         )
                     },
                     onCancel = { vm.cancelDownload() },
+                    modifier = modifier
+                )
+
+                MainDestination.ACCOUNT -> AccountScreen(
+                    profile = profile,
+                    deviceCode = deviceCode,
+                    busy = authBusy,
+                    status = authStatus,
+                    error = authError,
+                    offlineName = accountName,
+                    onStartLogin = { vm.startMicrosoftLogin() },
+                    onCancelLogin = { vm.cancelLogin() },
+                    onLogout = { vm.logout() },
+                    onOfflineNameChange = {
+                        accountName = it
+                        vm.setOfflineName(it)
+                    },
                     modifier = modifier
                 )
 
@@ -249,6 +275,7 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                         settings.lastAccount = it
                     },
                     onOpenControlEditor = { showControlEditor = true },
+                    onOpenAccount = { destination = MainDestination.ACCOUNT },
                     onOpenRuntime = { destination = MainDestination.RUNTIME },
                     onOpenLogs = { destination = MainDestination.LOGS },
                     onOpenAbout = { destination = MainDestination.ABOUT },

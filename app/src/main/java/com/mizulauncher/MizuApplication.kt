@@ -2,6 +2,9 @@ package com.mizulauncher
 
 import android.app.Application
 import android.content.Context
+import com.mizulauncher.auth.AccountSession
+import com.mizulauncher.auth.MinecraftProfile
+import com.mizulauncher.auth.ProfileCodec
 import com.mizulauncher.download.DownloadSource
 import com.mizulauncher.instance.InstanceManager
 import java.io.File
@@ -32,6 +35,18 @@ class AppContainer(context: Context) {
      * 放在容器里统一持有，避免各自维护一份导致换源后行为不一致。
      */
     val sourceFlow = kotlinx.coroutines.flow.MutableStateFlow(settings.downloadSource)
+
+    /** 账户会话：微软正版登录 + 令牌续期 + 持久化 */
+    val accountSession: AccountSession = AccountSession(
+        store = object : AccountSession.ProfileStore {
+            override fun load() = ProfileCodec.decode(settings.accountJson)
+            override fun save(profile: MinecraftProfile?) {
+                settings.accountJson = profile?.let(ProfileCodec::encode)
+                // 同步离线显示名，首页头像不至于空着
+                if (profile != null) settings.lastAccount = profile.name
+            }
+        }
+    )
 }
 
 /**
@@ -72,6 +87,11 @@ class SettingsStore(context: Context) {
      * Java 运行时远端清单地址（jre-index.json）。
      * 留空则只用 APK 内置的运行时；填写后可用于补齐未内置的版本（如 32 位的 Java 25）。
      */
+    /** 微软账户档案的 JSON（含 refresh_token，勿外传） */
+    var accountJson: String?
+        get() = prefs.getString(KEY_ACCOUNT_JSON, null)
+        set(value) = prefs.edit().putString(KEY_ACCOUNT_JSON, value).apply()
+
     var runtimeManifestUrl: String?
         get() = prefs.getString(KEY_RUNTIME_MANIFEST, null)?.takeIf { it.isNotBlank() }
         set(value) = prefs.edit().putString(KEY_RUNTIME_MANIFEST, value).apply()
@@ -85,6 +105,7 @@ class SettingsStore(context: Context) {
         const val KEY_THEME = "theme_mode"
         const val KEY_BG = "background_path"
         const val KEY_RUNTIME_MANIFEST = "runtime_manifest_url"
+        const val KEY_ACCOUNT_JSON = "account_json"
     }
 }
 

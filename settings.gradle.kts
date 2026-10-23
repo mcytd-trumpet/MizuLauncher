@@ -14,7 +14,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "PCLMobile"
+rootProject.name = "MizuLauncher"
 
 include(":app")
 include(":core:download")
@@ -22,3 +22,4 @@ include(":core:minecraft")
 include(":core:instance")
 include(":core:launcher-bridge")
 include(":core:runtime")
+include(":core:auth")

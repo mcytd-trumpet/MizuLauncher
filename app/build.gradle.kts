@@ -130,6 +130,7 @@ dependencies {
     implementation(project(":core:instance"))
     implementation(project(":core:launcher-bridge"))
     implementation(project(":core:runtime"))
+    implementation(project(":core:auth"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

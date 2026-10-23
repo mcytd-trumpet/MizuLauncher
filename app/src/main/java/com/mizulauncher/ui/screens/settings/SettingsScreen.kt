@@ -57,6 +57,7 @@ fun SettingsScreen(
     onRuntimeManifestChange: (String) -> Unit,
     onAccountChange: (String) -> Unit,
     onOpenControlEditor: () -> Unit,
+    onOpenAccount: () -> Unit,
     onOpenRuntime: () -> Unit,
     onOpenLogs: () -> Unit,
     onOpenAbout: () -> Unit,
@@ -242,6 +243,13 @@ fun SettingsScreen(
             GlassCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(vertical = 8.dp)) {
                     SectionHeader("其他", Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+                    SettingRow(
+                        title = "账户",
+                        subtitle = "微软正版登录 / 离线模式切换",
+                        icon = MizuIcons.Person,
+                        trailing = { Text("›") },
+                        onClick = onOpenAccount
+                    )
                     SettingRow(
                         title = "Java 运行时",
                         subtitle = "预装 / 下载 Java 8、17、21、25",

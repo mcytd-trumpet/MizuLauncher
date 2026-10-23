@@ -43,7 +43,8 @@ enum class MainDestination(val label: String, val icon: ImageVector) {
     HOME("主页", MizuIcons.Home),
     DOWNLOAD("下载", MizuIcons.Download),
     SETTINGS("设置", MizuIcons.Settings),
-    /** 以下几项不进底栏，仅由设置页跳转 */
+    /** 以下几项不进底栏，仅由设置页 / 首页头像跳转 */
+    ACCOUNT("账户", MizuIcons.Person),
     RUNTIME("Java 运行时", MizuIcons.Memory),
     LOGS("运行日志", MizuIcons.Log),
     ABOUT("关于", MizuIcons.Info);

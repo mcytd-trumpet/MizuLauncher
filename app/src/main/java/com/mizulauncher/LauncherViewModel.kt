@@ -3,6 +3,10 @@ package com.mizulauncher
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.mizulauncher.auth.DeviceCode
+import com.mizulauncher.auth.MicrosoftAuth
+import com.mizulauncher.auth.MinecraftProfile
+import com.mizulauncher.auth.TokenPoll
 import com.mizulauncher.bridge.LaunchOptions
 import com.mizulauncher.bridge.LaunchResult
 import com.mizulauncher.bridge.Renderer
@@ -11,10 +15,14 @@ import com.mizulauncher.download.DownloadSource
 import com.mizulauncher.instance.InstanceMeta
 import com.mizulauncher.minecraft.model.VersionEntry
 import com.mizulauncher.runtime.RuntimeManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 全局状态容器。
@@ -36,6 +44,7 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
     val settings: SettingsStore get() = container.settings
 
     val orchestrator = LaunchOrchestrator(app)
+    private val auth = MicrosoftAuth()
     val runtimeManager: RuntimeManager = RuntimeManager(
         context = app,
         sourceFlow = container.sourceFlow,
@@ -217,6 +226,122 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
                     if (result is LaunchResult.Failed) _error.value = result.reason
                 }
                 .onFailure { _error.value = it.message ?: "准备启动文件失败" }
+        }
+    }
+
+    // ---------------- 账户 ----------------
+
+    private val _profile = MutableStateFlow(container.accountSession.current())
+    val profile: StateFlow<MinecraftProfile?> = _profile.asStateFlow()
+
+    private val _deviceCode = MutableStateFlow<DeviceCode?>(null)
+    val deviceCode: StateFlow<DeviceCode?> = _deviceCode.asStateFlow()
+
+    private val _authBusy = MutableStateFlow(false)
+    val authBusy: StateFlow<Boolean> = _authBusy.asStateFlow()
+
+    private val _authStatus = MutableStateFlow<String?>(null)
+    val authStatus: StateFlow<String?> = _authStatus.asStateFlow()
+
+    private val _authError = MutableStateFlow<String?>(null)
+    val authError: StateFlow<String?> = _authError.asStateFlow()
+
+    private var authJob: Job? = null
+
+    /**
+     * 启动微软登录。
+     *
+     * 先拿设备码展示给用户，再按服务端给的 interval 轮询。
+     * `slow_down` 时把间隔加大一点点，这是 RFC 8628 的要求，
+     * 忽略它会被服务端持续拒绝。
+     */
+    fun startMicrosoftLogin() {
+        if (_authBusy.value) return
+        authJob?.cancel()
+        authJob = viewModelScope.launch {
+            _authBusy.value = true
+            _authError.value = null
+            _authStatus.value = "正在获取验证码"
+
+            val code = runCatching { auth.requestDeviceCode() }
+                .getOrElse {
+                    _authBusy.value = false
+                    _authStatus.value = null
+                    _authError.value = "获取验证码失败：${it.message}"
+                    return@launch
+                }
+            _deviceCode.value = code
+            _authStatus.value = "等待你完成登录…"
+
+            var interval = code.intervalSeconds.coerceAtLeast(1L)
+            val deadline = System.currentTimeMillis() + code.expiresInSeconds * 1000
+            while (System.currentTimeMillis() < deadline) {
+                delay(interval * 1000)
+                when (val poll = runCatching { auth.pollDeviceToken(code.deviceCode) }
+                    .getOrElse { TokenPoll.Failed(it.message ?: "网络错误") }) {
+                    TokenPoll.Pending -> _authStatus.value = "等待你完成登录…"
+                    TokenPoll.SlowDown -> interval += 2
+                    TokenPoll.Expired -> {
+                        finishAuth("验证码已过期，请重新登录")
+                        return@launch
+                    }
+                    TokenPoll.Declined -> {
+                        finishAuth("你在浏览器中拒绝了授权")
+                        return@launch
+                    }
+                    is TokenPoll.Failed -> {
+                        finishAuth(poll.message)
+                        return@launch
+                    }
+                    is TokenPoll.Done -> {
+                        _authStatus.value = "登录成功，正在验证正版…"
+                        runCatching { auth.loginWithXbox(poll.token) }
+                            .onSuccess { p ->
+                                container.accountSession.save(p)
+                                _profile.value = p
+                                settings.lastAccount = p.name
+                                finishAuth(null)
+                            }
+                            .onFailure {
+                                finishAuth(it.message ?: "正版验证失败")
+                            }
+                        return@launch
+                    }
+                }
+            }
+            finishAuth("验证码已过期，请重新登录")
+        }
+    }
+
+    private fun finishAuth(message: String?) {
+        _deviceCode.value = null
+        _authBusy.value = false
+        _authStatus.value = null
+        if (message != null) _authError.value = message
+    }
+
+    fun cancelLogin() {
+        authJob?.cancel()
+        _deviceCode.value = null
+        _authBusy.value = false
+        _authStatus.value = null
+    }
+
+    fun logout() {
+        container.accountSession.logout()
+        _profile.value = null
+        _authError.value = null
+    }
+
+    fun setOfflineName(name: String) {
+        settings.lastAccount = name
+    }
+
+    /** 启动时顺手续期：令牌快过期就静默刷新，失败就给个提示但不打扰 */
+    fun refreshAccountIfNeeded() {
+        viewModelScope.launch {
+            val valid = withContext(Dispatchers.IO) { container.accountSession.valid() }
+            _profile.value = valid
         }
     }
 
