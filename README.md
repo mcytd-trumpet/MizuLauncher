@@ -28,6 +28,7 @@ app                      UI（Compose/Material3）+ 编排层
  ├─ LaunchOrchestrator   装 → 拼参数 → 启动，一条链
  ├─ ui/screens/home       主页：实例卡片网格（2/3/4 列响应式）
  ├─ ui/screens/download   下载页：版本列表 + 加载器选择 + 进度
+ ├─ ui/screens/account    账户：微软正版登录（设备码）/ 离线名
  ├─ ui/screens/runtime    Java 运行时管理（8/17/21/25 的安装与删除）
  ├─ ui/screens/settings   设置：下载源/线程/内存/渲染器/主题/背景
  ├─ ui/screens/control    触屏按键布局编辑器
@@ -39,6 +40,7 @@ core/download          高速下载引擎（镜像重写 + 分段并发 + 熔断
 core/minecraft         版本清单/规则引擎/下载计划/加载器安装
 core/instance          实例管理 + 启动参数构造（纯 JVM，可单测）
 core/runtime           Java 运行时管理（内置解压 + 远端下载 + SHA1 校验）
+core/auth              微软登录（设备码 → XBL → XSTS → MC Services）+ 令牌续期
 core/launcher-bridge   内核抽象接口 + 启动前兼容性预检
 ```
 
@@ -82,6 +84,7 @@ var instances by remember { mutableStateOf(container.instanceManager.list()) }
 | `core:instance` 单测 | 8/8 通过 |
 | `core:download` 单测 | 10/10 通过 |
 | `core:runtime` 单测 | 7/7 通过 |
+| `core:auth` 单测 | 18/18 通过（登录链路、令牌续期、JSON 往返） |
 | 五个 ABI 变体编译 | 全部 BUILD SUCCESSFUL，单包约 17 MB（不含 JRE） |
 
 > 低内存机器编译若遇到 Gradle daemon 被杀，加参数：
@@ -272,7 +275,9 @@ if (cfg != null) {
 - Forge/NeoForge 的 **processors（二进制补丁）不在手机上执行**，依赖 Pojav 内核运行期处理；
   极端老版本（1.7.10 之前）可能需要手工补库。
 - OptiFine 不自动安装（许可不允许），只给引导。
-- 微软正版登录未实现，当前仅离线账号（`Account.offlineUuid` 已按官方算法生成）。
+- 微软登录用的 client id 是 Pojav 项目长期公开的那个；如需独立分发，请在 Azure 注册后
+  通过 `MicrosoftAuth(clientId = "…")` 换掉。
+- 正版皮肤不单独下载，交给游戏内核处理。
 - 触屏按键布局编辑器可拖拽，但布局 JSON 持久化尚未接线（`LayoutStore` 待补）。
 - 内置 JRE 需要自行准备归档；仓库不附带二进制（体积 + 分发合规）。
 
