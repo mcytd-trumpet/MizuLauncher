@@ -75,12 +75,24 @@ fun UpdateDialog(
                     Spacer(Modifier.height(12.dp))
                 }
 
-                // 明确告诉用户会装哪个包，避免「为什么给我下 universal」的疑惑
+                // 明确告诉用户会装哪个包、为什么是这个包，避免「为什么给我下 universal」的疑惑
                 info.asset?.let { a ->
                     Text(
-                        "安装包：${a.name}",
+                        "安装包：${a.name}" + if (a.sizeBytes > 0) " · ${a.sizeText}" else "",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "已按本机 ${UpdateChecker.abiLabel(info.deviceAbi)} 匹配",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                if (info.asset == null) {
+                    Text(
+                        "这个版本没有提供适配 ${info.deviceAbi} 的安装包。请到 GitHub Release 页面手动挑选，不要装错架构——装错会直接闪退。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
                     )
                 }
 
@@ -91,7 +103,10 @@ fun UpdateDialog(
                         modifier = Modifier.fillMaxWidth()
                     )
                     Spacer(Modifier.height(6.dp))
-                    Text("$progress%", style = MaterialTheme.typography.labelSmall)
+                    Text(
+                        if (progress >= 100) "校验安装包…" else "$progress%",
+                        style = MaterialTheme.typography.labelSmall
+                    )
                 } else if (status != null) {
                     Spacer(Modifier.height(8.dp))
                     Text(
@@ -105,8 +120,9 @@ fun UpdateDialog(
         },
         confirmButton = {
             when {
-                readyToInstall -> Button(onClick = onInstall) { Text("立即安装") }
+                // 顺序很重要：下载中要优先于「可安装」，否则断点续传时按钮会变成「立即安装」
                 downloading -> TextButton(onClick = onCancelDownload) { Text("取消下载") }
+                readyToInstall -> Button(onClick = onInstall) { Text("立即安装") }
                 info.asset != null -> Button(onClick = onDownload) { Text("下载更新") }
                 else -> TextButton(onClick = onDismiss) { Text("知道了") }
             }

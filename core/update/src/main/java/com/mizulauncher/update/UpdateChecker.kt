@@ -26,8 +26,28 @@ class UpdateChecker(
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
 
-        /** APK 文件名里的架构标记，顺序即优先级 */
+        /** APK 文件名里的架构标记，顺序即优先级（注意 x64 必须排在 x86 前面） */
         val ABI_TAGS = listOf("arm64", "arm32", "x64", "x86", "universal")
+
+        /** 架构的中文说明，用于「下载哪个包」的提示 */
+        fun abiLabel(abi: String): String = when (abi) {
+            "arm64" -> "ARM64（绝大多数手机）"
+            "arm32" -> "ARM32（老旧 32 位设备）"
+            "x64" -> "x86_64（模拟器 / Intel 平板）"
+            "x86" -> "x86（32 位模拟器）"
+            "universal" -> "全架构通用包"
+            else -> abi
+        }
+
+        /**
+         * 从 APK 文件名里取 versionCode（CI 会编进名字：`MizuLauncher-1.2.3-10203-arm64.apk`）。
+         *
+         * 比 tag 更可信：tag 可能手滑写成 `v1.2.3.4` 或漏写 `v`，
+         * 而 versionCode 是打包时 Gradle 用的同一个数。
+         */
+        fun versionCodeFromName(name: String): Int? =
+            Regex("""-(\d{3,})-(?:arm32|arm64|x86|x64|universal)\.apk$""")
+                .find(name)?.groupValues?.get(1)?.toIntOrNull()
 
         /**
          * 设备该装哪个包。
@@ -74,7 +94,17 @@ class UpdateChecker(
         }
     }
 
-    data class ReleaseAsset(val name: String, val url: String, val sizeBytes: Long)
+    data class ReleaseAsset(val name: String, val url: String, val sizeBytes: Long) {
+        /** 这个包对应的架构标记，识别不出返回 null */
+        val abi: String? get() = abiOfAsset(name)
+        /** 文件大小（人类可读） */
+        val sizeText: String
+            get() = when {
+                sizeBytes <= 0 -> "未知大小"
+                sizeBytes >= 1L shl 20 -> "%.1f MB".format(sizeBytes / 1024.0 / 1024.0)
+                else -> "%d KB".format(sizeBytes / 1024)
+            }
+    }
 
     data class UpdateInfo(
         val tag: String,
@@ -85,8 +115,15 @@ class UpdateChecker(
         /** 当前设备应该下载的那个包 */
         val asset: ReleaseAsset?,
         /** 这个版本提供的全部 APK，用于架构识别失败时的兜底展示 */
-        val allAssets: List<ReleaseAsset>
-    )
+        val allAssets: List<ReleaseAsset>,
+        /** 本机已下载过的资源名（与 [asset] 同名时可跳过下载直接装） */
+        val cachedAssetName: String? = null,
+        /** 本机判定出的架构标记，用于把「为什么选了这个包」讲清楚 */
+        val deviceAbi: String = "universal"
+    ) {
+        /** 已有同版本安装包可复用 */
+        val reuseCached: Boolean get() = asset != null && asset.name == cachedAssetName
+    }
 
     /**
      * 查最新 Release。
@@ -112,7 +149,9 @@ class UpdateChecker(
         releaseJson: String,
         currentVersionCode: Int,
         currentVersionName: String,
-        deviceAbis: List<String>
+        deviceAbis: List<String>,
+        /** 本机已下载过的资源名；与远端一致时可直接复用，不必重下 */
+        cachedAssetName: String? = null
     ): UpdateInfo? {
         val release = runCatching { JsonParser.parseString(releaseJson).asJsonObject }
             .getOrNull() ?: return null
@@ -133,9 +172,10 @@ class UpdateChecker(
         if (!newer) return null
 
         val wantAbi = pickAbiFor(deviceAbis)
-        val asset = assets.firstOrNull { abiOfAsset(it.name) == wantAbi }
-            // 没有精确匹配就用 universal；再没有就不给下载按钮，只提示去网页下
-            ?: assets.firstOrNull { abiOfAsset(it.name) == "universal" }
+        val exact = assets.firstOrNull { abiOfAsset(it.name) == wantAbi }
+        // 没有精确匹配就用 universal 兜底。绝不给别的架构的包：
+        // 往 x86 设备塞 arm64 包装完必闪退，用户只会说「更新后打不开了」。
+        val asset = exact ?: assets.firstOrNull { abiOfAsset(it.name) == "universal" }
 
         return UpdateInfo(
             tag = tag,
@@ -143,10 +183,21 @@ class UpdateChecker(
             versionCode = remoteCode,
             notes = release["body"]?.asString?.takeIf { !it.isNullOrBlank() } ?: "",
             publishedAt = release["published_at"]?.asString ?: "",
+            // null 表示「有新版但没有适配本机的包」，UI 会引导去网页手动挑
             asset = asset,
-            allAssets = assets
+            allAssets = assets,
+            cachedAssetName = cachedAssetName,
+            deviceAbi = wantAbi
         )
     }
+
+    /**
+     * 拉 Release JSON 的公开入口。
+     *
+     * 单独暴露是为了让调用方能把原文缓存下来：手机在电梯里点「检查更新」时，
+     * 拿上次的 JSON 重新解析一遍，总比直接甩出「检查失败」有用。
+     */
+    fun fetchLatestReleaseJsonPublic(): String? = fetchLatestReleaseJson()
 
     private fun fetchLatestReleaseJson(): String? {
         val req = Request.Builder()
@@ -177,9 +228,7 @@ class UpdateChecker(
     /** CI 把 versionCode 编进文件名：MizuLauncher-1.0.0-10000-arm64.apk */
     private fun versionCodeFromAssets(assets: List<ReleaseAsset>): Int? {
         for (a in assets) {
-            val m = Regex("""-(\d{3,})-(?:arm32|arm64|x86|x64|universal)\.apk$""")
-                .find(a.name) ?: continue
-            return m.groupValues[1].toIntOrNull()
+            versionCodeFromName(a.name)?.let { return it }
         }
         return null
     }

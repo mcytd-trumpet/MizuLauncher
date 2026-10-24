@@ -143,6 +143,10 @@ fun ProgressBlock(
     stage: String,
     detail: String,
     speedText: String? = null,
+    /** 剩余时间文案，例如「约 2 分 10 秒」；为 null 不显示 */
+    etaText: String? = null,
+    /** 文件计数，例如「128 / 460」；为 null 不显示 */
+    fileCountText: String? = null,
     modifier: Modifier = Modifier
 ) {
     Column(modifier.fillMaxWidth()) {
@@ -168,8 +172,93 @@ fun ProgressBlock(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            if (speedText != null) Text(speedText, style = MaterialTheme.typography.bodyMedium)
+            val tail = listOfNotNull(etaText, fileCountText, speedText).joinToString("  ")
+            if (tail.isNotBlank()) {
+                Text(tail, style = MaterialTheme.typography.bodyMedium)
+            }
         }
+    }
+}
+
+/**
+ * 下载任务卡（全局浮层用）。
+ *
+ * 用户离开下载页去翻设置、看日志时，下载仍在跑——必须有个常驻入口能看见进度、
+ * 能取消，否则会误以为「卡死了」而强杀进程。
+ */
+@Composable
+fun DownloadTaskCard(
+    title: String,
+    percent: Int,
+    stage: String,
+    detail: String,
+    speedText: String? = null,
+    etaText: String? = null,
+    fileCountText: String? = null,
+    onCancel: () -> Unit,
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    GlassCard(modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.surface) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    title,
+                    style = MaterialTheme.typography.titleSmall,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                androidx.compose.material3.TextButton(onClick = onCancel) { Text("取消") }
+            }
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(
+                progress = { percent / 100f },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp))
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (detail.isBlank()) stage else "$stage · $detail",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val tail = listOfNotNull(etaText, fileCountText, speedText).joinToString("  ")
+                if (tail.isNotBlank()) {
+                    Text(
+                        tail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.height(2.dp))
+            androidx.compose.material3.TextButton(
+                onClick = onOpen,
+                modifier = Modifier.align(Alignment.End)
+            ) { Text("查看详情") }
+        }
+    }
+}
+
+/** 秒 → 「约 1 分 20 秒」；<=0 返回 null */
+fun formatEta(seconds: Long): String? {
+    if (seconds <= 0) return null
+    return when {
+        seconds < 60 -> "约 $seconds 秒"
+        seconds < 3600 -> "约 ${seconds / 60} 分 ${seconds % 60} 秒"
+        else -> "约 ${seconds / 3600} 小时 ${(seconds % 3600) / 60} 分"
     }
 }
 

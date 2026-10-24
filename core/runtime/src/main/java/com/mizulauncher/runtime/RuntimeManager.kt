@@ -32,8 +32,10 @@ import java.util.zip.ZipInputStream
  * | 更新的版本/快照 | 25 |
  *
  * ## 两条来源并存
- * 1. **内置**：APK `assets/runtime/<abi>/jre-<major>.zip`（CI 打包时塞进去的），首次启动解压即可用，零流量；
- * 2. **按需下载**：内置没有的（比如 32 位机型里的 Java 25），走 [DownloadEngine] 从远端拉取。
+ * 1. **内置**：APK `assets/runtime/<abi>/jre-<major>.zip`（CI 打包时塞进去的）。
+ *    由 `core:setup` 的首启「补全依赖」流程解压到 `files/bundles/runtime/java-<major>`，
+ *    本类只负责**使用**，不重复解压——同一份 JRE 铺两遍既慢又费空间；
+ * 2. **按需下载**：包里没带的（比如 32 位机型里的 Java 25），走 [DownloadEngine] 从远端拉取。
  *
  * 先内置、后下载 —— 这样装机即用，又不会因为漏打一个架构就彻底不可用。
  */
@@ -42,7 +44,12 @@ class RuntimeManager(
     private val sourceFlow: StateFlow<DownloadSource>,
     /** 远端清单地址，由设置/CI 注入；为空时只用内置 */
     private val manifestUrlProvider: () -> String?,
-    private val client: OkHttpClient = DownloadEngine.defaultClient()
+    private val client: OkHttpClient = DownloadEngine.defaultClient(),
+    /**
+     * 已由首启「补全依赖」流程解压好的运行时根目录（`files/bundles/runtime`）。
+     * 新版 APK 装配后 JRE 先走这里，不必再解一次。
+     */
+    private val extractedRootProvider: () -> File? = { null }
 ) {
 
     /** 支持的 Java 大版本，顺序即 UI 展示顺序 */
@@ -80,7 +87,22 @@ class RuntimeManager(
     private val runtimesDir: File
         get() = File(context.filesDir, "runtime").apply { mkdirs() }
 
-    fun dirOf(major: Int): File = File(runtimesDir, "java-$major")
+    /**
+     * Java 大版本对应的目录。
+     *
+     * 优先级：首启解压出来的 `bundles/runtime/java-x` → 本模块自管的 `files/runtime/java-x`。
+     * 两者都存在时以前者为准，避免同一份 JRE 占两遍磁盘。
+     */
+    fun dirOf(major: Int): File {
+        extractedRootProvider()?.let { root ->
+            val shared = File(root, "java-$major")
+            if (isReadyDir(shared)) return shared
+        }
+        return File(runtimesDir, "java-$major")
+    }
+
+    /** 本模块自管的目录（下载/解压的落点） */
+    private fun managedDirOf(major: Int): File = File(runtimesDir, "java-$major")
 
     // ---------------- 状态刷新 ----------------
 
@@ -163,18 +185,9 @@ class RuntimeManager(
                 return@withContext fail(major, "该架构（$abi）没有 Java $major 运行时")
             }
 
-            // 1. 内置资产优先：只探测条目是否存在，不读全量数据
-            val builtin = "runtime/$abi/jre-$major.zip"
-            val hasBuiltin = runCatching {
-                context.assets.open(builtin).use { true }
-            }.getOrDefault(false)
-
-            if (hasBuiltin) {
-                updateState(major, State.Extracting(0), onProgress)
-                return@withContext extractFromAssets(builtin, major, onProgress)
-            }
-
-            // 2. 远端下载
+            // 内置资产已由 core:setup 的首启流程统一解压到 bundles/runtime，
+            // 上面 isReady() 已经命中；走到这里说明包里没带，或用户手动删了，
+            // 只能走远端下载。
             val manifest = fetchManifest()
             val entry = manifest?.entries?.firstOrNull { it.major == major && it.abi == abi }
                 ?: return@withContext fail(
@@ -185,32 +198,6 @@ class RuntimeManager(
 
             downloadAndExtract(entry, major, onProgress)
         }
-
-    private suspend fun extractFromAssets(
-        assetPath: String,
-        major: Int,
-        onProgress: (State) -> Unit
-    ): Result<File> = runCatching {
-        val target = dirOf(major)
-        if (target.exists()) target.deleteRecursively()
-        target.mkdirs()
-
-        // assets 里的 JRE 是未压缩存储的（aaptOptions.noCompress），因此可以直接拿到
-        // 真实字节长度用于百分比；拿不到就退化成按条目数报进度。
-        val totalHint = runCatching {
-            context.assets.openFd(assetPath).use { it.length }
-        }.getOrDefault(-1L)
-
-        context.assets.open(assetPath).use { input ->
-            unzip(input, target, totalHint) { pct ->
-                updateState(major, State.Extracting(pct), onProgress)
-            }
-        }
-        flattenIfNeeded(target)
-        if (!isReady(major)) throw IllegalStateException("解压完成但未找到 JVM，压缩包可能损坏")
-        refresh()
-        target
-    }.onFailure { updateState(major, State.Failed("解压失败：${it.message}"), onProgress) }
 
     private suspend fun downloadAndExtract(
         entry: ManifestEntry,
@@ -263,7 +250,7 @@ class RuntimeManager(
             }
         }
 
-        val target = dirOf(major)
+        val target = managedDirOf(major)
         if (target.exists()) target.deleteRecursively()
         target.mkdirs()
         zipFile.inputStream().use { input ->
@@ -280,7 +267,9 @@ class RuntimeManager(
 
     /** 删除某个运行时 */
     fun remove(major: Int): Boolean {
-        val ok = dirOf(major).deleteRecursively()
+        // 解压来源与下载来源都要删干净，否则删了还会「自动复活」
+        extractedRootProvider()?.let { File(it, "java-$major").deleteRecursively() }
+        val ok = managedDirOf(major).deleteRecursively()
         refresh()
         return ok
     }

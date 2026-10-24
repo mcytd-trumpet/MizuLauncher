@@ -39,6 +39,10 @@ fun AboutScreen(
     versionCode: Int,
     bridgeInfo: BridgeInfo?,
     onOpenSource: (String) -> Unit,
+    /** 检查中时禁用按钮，避免连点打一串接口 */
+    updateChecking: Boolean = false,
+    updateStatus: String? = null,
+    onCheckUpdate: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -74,6 +78,36 @@ fun AboutScreen(
             )
         }
 
+        SectionHeader("版本")
+        GlassCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            Column {
+                SettingRow(
+                    title = "检查更新",
+                    subtitle = updateStatus ?: "从 GitHub Releases 获取最新安装包",
+                    icon = MizuIcons.Refresh,
+                    trailing = {
+                        androidx.compose.material3.TextButton(
+                            onClick = onCheckUpdate,
+                            enabled = !updateChecking
+                        ) { Text(if (updateChecking) "检查中…" else "检查") }
+                    }
+                )
+                SettingRow(
+                    title = "项目主页",
+                    subtitle = "github.com/mcytd-trumpet/MizuLauncher",
+                    icon = MizuIcons.Info,
+                    onClick = { onOpenSource("https://github.com/mcytd-trumpet/MizuLauncher") }
+                )
+                SettingRow(
+                    title = "问题反馈",
+                    subtitle = "遇到闪退请附上运行日志",
+                    icon = MizuIcons.Bug,
+                    onClick = { onOpenSource("https://github.com/mcytd-trumpet/MizuLauncher/issues") }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
         SectionHeader("运行内核")
         GlassCard(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
             Column {

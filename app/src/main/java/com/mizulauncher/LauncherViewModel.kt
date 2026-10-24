@@ -10,6 +10,7 @@ import com.mizulauncher.auth.TokenPoll
 import com.mizulauncher.bridge.LaunchOptions
 import com.mizulauncher.bridge.LaunchResult
 import com.mizulauncher.bridge.Renderer
+import java.io.File
 import com.mizulauncher.update.ApkDownloader
 import com.mizulauncher.update.UpdateChecker
 import com.mizulauncher.download.DownloadProgress
@@ -17,6 +18,8 @@ import com.mizulauncher.download.DownloadSource
 import com.mizulauncher.instance.InstanceMeta
 import com.mizulauncher.minecraft.model.VersionEntry
 import com.mizulauncher.runtime.RuntimeManager
+import com.mizulauncher.setup.BundleCatalog
+import com.mizulauncher.setup.BundleInstaller
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -47,10 +50,15 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
 
     val orchestrator = LaunchOrchestrator(app)
     private val auth = MicrosoftAuth()
+    /** 内置组件解压器（首启「补全依赖」） */
+    val bundleInstaller: BundleInstaller = BundleInstaller(app)
+
     val runtimeManager: RuntimeManager = RuntimeManager(
         context = app,
         sourceFlow = container.sourceFlow,
-        manifestUrlProvider = { container.settings.runtimeManifestUrl }
+        manifestUrlProvider = { container.settings.runtimeManifestUrl },
+        // 首启解压出来的 JRE 直接给运行时管理器用，避免同一份再解一遍
+        extractedRootProvider = { java.io.File(bundleInstaller.installRoot, "runtime") }
     )
 
     // ---------------- 实例 ----------------
@@ -147,6 +155,55 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
         runtimeManager.refresh()
     }
 
+    // ---------------- 内置组件补全（首启 / 更新后） ----------------
+
+    val bundleItems: StateFlow<List<BundleCatalog.Item>> = bundleInstaller.items
+    val bundlePending: StateFlow<List<BundleCatalog.Item>> = bundleInstaller.pending
+    val bundleStates: StateFlow<Map<String, BundleInstaller.ItemState>> = bundleInstaller.states
+    val bundlePhase: StateFlow<BundleInstaller.Phase> = bundleInstaller.phase
+
+    private val _setupDismissed = MutableStateFlow(false)
+
+    /** 用户选了「稍后」——本次启动不再弹，但启动游戏前仍会拦一次 */
+    val setupDismissed: StateFlow<Boolean> = _setupDismissed.asStateFlow()
+
+    fun dismissSetup() {
+        _setupDismissed.value = true
+    }
+
+    /** 重新扫描内置组件（升级后 / 清过数据后） */
+    fun rescanBundles() {
+        viewModelScope.launch(Dispatchers.IO) {
+            bundleInstaller.scan()
+            runtimeManager.refresh()
+        }
+    }
+
+    /** 开始解压待安装组件；完成后刷新运行时状态 */
+    fun installBundles() {
+        viewModelScope.launch {
+            val ok = bundleInstaller.installAll()
+            runtimeManager.refresh()
+            bundleInstaller.clearIndexCache()
+            if (ok) {
+                _setupDismissed.value = false
+                _bundleNotice.value = "依赖已补全"
+            } else {
+                val phase = bundleInstaller.phase.value
+                _bundleNotice.value = (phase as? BundleInstaller.Phase.Failed)?.message ?: "依赖安装失败"
+            }
+        }
+    }
+
+    private val _bundleNotice = MutableStateFlow<String?>(null)
+
+    /** 一次性的提示文案（装完了 / 装失败），UI 弹个 toast 后清掉 */
+    val bundleNotice: StateFlow<String?> = _bundleNotice.asStateFlow()
+
+    fun consumeBundleNotice() {
+        _bundleNotice.value = null
+    }
+
     /** 下载/解压某个 Java 运行时 */
     fun installRuntime(major: Int) {
         viewModelScope.launch {
@@ -195,9 +252,20 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** 启动选中实例：先补运行时 → 再准备文件 → 最后拉起内核 */
+    /**
+     * 启动选中实例：先补运行时 → 再准备文件 → 最后拉起内核。
+     *
+     * 启动前多一道内置组件检查：JRE 还没解压就开游戏，只会得到一句
+     * `Cannot run program "java"`，用户根本不知道要先去补依赖。
+     */
     fun launch(meta: InstanceMeta) {
         if (_installing.value) return
+        if (bundleInstaller.pending.value.isNotEmpty()) {
+            // 把补全弹窗重新叫出来（用户可能点过「稍后」）
+            _setupDismissed.value = false
+            _bundleNotice.value = "请先补全运行依赖，再启动游戏"
+            return
+        }
         viewModelScope.launch {
             _installing.value = true
 
@@ -352,6 +420,7 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
 
     private val updateChecker = UpdateChecker(http = okhttp3.OkHttpClient.Builder().build())
     private val apkDownloader = ApkDownloader()
+    private val releaseCache = File(application.cacheDir, "update-release.json")
 
     private val _update = MutableStateFlow<UpdateChecker.UpdateInfo?>(null)
     val update: StateFlow<UpdateChecker.UpdateInfo?> = _update.asStateFlow()
@@ -359,73 +428,145 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
     private val _updateChecking = MutableStateFlow(false)
     val updateChecking: StateFlow<Boolean> = _updateChecking.asStateFlow()
 
+    /**
+     * 是否正在下载安装包。
+     *
+     * 独立成一个布尔值，而不是让 UI 去比对状态文案。
+     * 之前用 `updateStatus == "正在下载…"` 判断，文案一改按钮就失灵——
+     * 这种「靠字符串传递状态」的写法是纯粹的定时炸弹。
+     */
+    private val _updateDownloading = MutableStateFlow(false)
+    val updateDownloading: StateFlow<Boolean> = _updateDownloading.asStateFlow()
+
     private val _updateProgress = MutableStateFlow(0)
     val updateProgress: StateFlow<Int> = _updateProgress.asStateFlow()
 
     private val _updateStatus = MutableStateFlow<String?>(null)
     val updateStatus: StateFlow<String?> = _updateStatus.asStateFlow()
 
-    /** -1 表示当前设备找不到可下载的包 */
+    /** 一次性的提示（「已是最新版本」这类），UI 用 Snackbar/Toast 消费后清掉 */
+    private val _updateToast = MutableStateFlow<String?>(null)
+    val updateToast: StateFlow<String?> = _updateToast.asStateFlow()
+
+    fun consumeUpdateToast() {
+        _updateToast.value = null
+    }
+
     private val _downloadedApk = MutableStateFlow<java.io.File?>(null)
     val downloadedApk: StateFlow<java.io.File?> = _downloadedApk.asStateFlow()
 
     private var updateJob: Job? = null
 
+    /** 上次成功查到的 Release JSON，没网时用来兜底 */
+    private var cachedReleaseJson: String? = null
+    /** 本机已下载的资源名（复用判断用） */
+    private var downloadedAssetName: String? = null
+
     /**
      * 检查更新。
      *
-     * `versionCode` 取自 BuildConfig，Release 资源名里也带同一个数，
-     * 两边对得上才不会误报「有新版本」。
+     * 三件事容易出错，这里都做了兜底：
+     *  1. **没网/接口挂了**：如果之前查到过新版，就用手上的缓存继续提示，
+     *     而不是让用户点「检查更新」得到一个「检查失败」然后什么也做不了；
+     *  2. **versionCode 比对**：取 Release 资源名里的数字（打包时 Gradle 用的同一个值），
+     *     比 tag 字符串可靠得多；
+     *  3. **架构匹配**：只给本机能装的包，匹配不到就明说，不装错包。
      */
     fun checkForUpdate(manual: Boolean = false) {
         if (_updateChecking.value) return
         viewModelScope.launch {
             _updateChecking.value = true
             if (manual) _updateStatus.value = "正在检查更新…"
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    updateChecker.checkForUpdate(
-                        currentVersionCode = BuildConfig.VERSION_CODE,
-                        currentVersionName = BuildConfig.VERSION_NAME,
-                        deviceAbis = android.os.Build.SUPPORTED_ABIS.toList()
-                    )
+
+            val fetched = withContext(Dispatchers.IO) { updateChecker.fetchLatestReleaseJsonPublic() }
+            if (fetched != null) {
+                cachedReleaseJson = fetched
+                withContext(Dispatchers.IO) {
+                    runCatching { releaseCache.writeText(fetched) }
+                }
+            } else if (cachedReleaseJson == null) {
+                // 冷启动 + 没网：读上次落盘的那份，让弹窗仍能出现
+                cachedReleaseJson = withContext(Dispatchers.IO) {
+                    runCatching { releaseCache.takeIf { it.isFile }?.readText() }.getOrNull()
                 }
             }
+
+            val json = cachedReleaseJson
+            if (json == null) {
+                _updateChecking.value = false
+                if (manual) _updateToast.value = "检查更新失败：网络不可用"
+                return@launch
+            }
+
+            val info = runCatching {
+                updateChecker.parseRelease(
+                    releaseJson = json,
+                    currentVersionCode = BuildConfig.VERSION_CODE,
+                    currentVersionName = BuildConfig.VERSION_NAME,
+                    deviceAbis = android.os.Build.SUPPORTED_ABIS.toList(),
+                    cachedAssetName = downloadedAssetName
+                )
+            }.getOrNull()
             _updateChecking.value = false
-            result.onSuccess { info ->
-                _update.value = info
-                _updateStatus.value = when {
-                    info == null && manual -> "已是最新版本"
-                    info == null -> null
-                    info.asset == null -> "发现新版本 ${info.versionName}，但没有匹配本机架构的安装包"
-                    else -> null
+
+            // 手动检查时必须给反馈，自动检查只在有新版本时打扰
+            val silent = !manual
+            if (info == null) {
+                _update.value = null
+                _updateStatus.value = null
+                if (!silent) _updateToast.value = "已是最新版本 ${BuildConfig.VERSION_NAME}"
+                return@launch
+            }
+
+            _update.value = info
+            if (info.asset == null) {
+                _updateStatus.value =
+                    "这个版本没有适配本机（${info.deviceAbi}）的安装包，请到 Release 页面手动选择"
+            } else if (info.reuseCached) {
+                // 同版本的包已经下过了，直接给「立即安装」，别再让用户白等一次
+                val file = apkFileOf(info)
+                if (file.isFile && file.length() > 0) {
+                    _downloadedApk.value = file
+                    _updateStatus.value = "安装包已就绪"
                 }
-            }.onFailure {
-                _updateStatus.value = if (manual) "检查更新失败：${it.message}" else null
             }
         }
     }
 
-    /** 下载更新包，完成后 UI 调 [installUpdate] 拉起系统安装器 */
+    /** 下载更新包，完成后 UI 调 [installApk] 拉起系统安装器 */
     fun downloadUpdate() {
         val info = _update.value ?: return
         val asset = info.asset ?: return
-        if (_downloadedApk.value != null) return
+        if (_updateDownloading.value) return
         updateJob?.cancel()
         updateJob = viewModelScope.launch {
+            _updateDownloading.value = true
             _updateProgress.value = 0
-            _updateStatus.value = "正在下载…"
-            val dir = java.io.File(getApplication<Application>().cacheDir, "updates").apply { mkdirs() }
-            // 固定文件名，方便断点续传；URL 里带了版本号，换了版本自然换文件
-            val target = java.io.File(dir, "MizuLauncher-${info.versionName}-${asset.name.substringAfterLast('-')}")
+            _updateStatus.value = null
+            val target = apkFileOf(info)
+            // 换了版本就把旧包清掉，免得缓存里堆一堆几十兆的无用文件
+            runCatching {
+                target.parentFile?.listFiles()?.filter { it.name != target.name }?.forEach { it.delete() }
+            }
+
             val result = apkDownloader.download(asset.url, target) { p ->
                 _updateProgress.value = p.percent
             }
+
+            _updateDownloading.value = false
             result.onSuccess { file ->
+                // 长度为 0 说明响应体是空的，装上去必然解析失败
+                if (file.length() <= 0) {
+                    _updateStatus.value = "下载失败：安装包为空"
+                    _updateProgress.value = 0
+                    return@onSuccess
+                }
+                downloadedAssetName = asset.name
                 _downloadedApk.value = file
-                _updateStatus.value = "下载完成"
+                _updateProgress.value = 100
+                _updateStatus.value = "下载完成，可以安装了"
             }.onFailure {
-                _updateStatus.value = "下载失败：${it.message}"
+                _updateStatus.value = "下载失败：${it.message ?: "网络中断"}"
                 _updateProgress.value = 0
             }
         }
@@ -433,15 +574,24 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
 
     fun cancelUpdateDownload() {
         updateJob?.cancel()
+        _updateDownloading.value = false
         _updateProgress.value = 0
         _updateStatus.value = null
     }
 
+    /** 关闭更新弹窗。已下载的包**保留**，下次检查到同一版本还能直接装 */
     fun dismissUpdate() {
         _update.value = null
         _updateStatus.value = null
         _updateProgress.value = 0
-        _downloadedApk.value = null
+        // 注意：不复位 _downloadedApk，否则用户关掉弹窗再打开就得重下
+    }
+
+    /** 安装包落盘路径：文件名带版本号与架构，便于断点续传与复用判断 */
+    private fun apkFileOf(info: UpdateChecker.UpdateInfo): java.io.File {
+        val dir = java.io.File(application.cacheDir, "updates").apply { mkdirs() }
+        val name = info.asset?.name ?: "MizuLauncher-${info.versionName}.apk"
+        return java.io.File(dir, name)
     }
 
     fun cancelDownload() {

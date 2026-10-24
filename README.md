@@ -30,6 +30,7 @@ app                      UI（Compose/Material3）+ 编排层
  ├─ ui/screens/download   下载页：版本列表 + 加载器选择 + 进度
  ├─ ui/screens/account    账户：微软正版登录（设备码）/ 离线名
  ├─ ui/screens/runtime    Java 运行时管理（8/17/21/25 的安装与删除）
+ ├─ ui/screens/dependencies 内置组件总览（解压状态/体积/重新扫描）
  ├─ ui/screens/settings   设置：下载源/线程/内存/渲染器/主题/背景
  ├─ ui/screens/control    触屏按键布局编辑器
  ├─ ui/screens/log        运行日志
@@ -39,7 +40,9 @@ app                      UI（Compose/Material3）+ 编排层
 core/download          高速下载引擎（镜像重写 + 分段并发 + 熔断）
 core/minecraft         版本清单/规则引擎/下载计划/加载器安装
 core/instance          实例管理 + 启动参数构造（纯 JVM，可单测）
-core/runtime           Java 运行时管理（内置解压 + 远端下载 + SHA1 校验）
+core/runtime           Java 运行时管理（使用已解压 JRE + 远端下载 + SHA1 校验）
+core/setup             内置组件补全（扫描 assets → 比对版本指纹 → 解压 + 中断恢复）
+core/update            应用内更新（查 Release → 按 ABI 挑包 → 断点续传下载）
 core/auth              微软登录（设备码 → XBL → XSTS → MC Services）+ 令牌续期
 core/launcher-bridge   内核抽象接口 + 启动前兼容性预检
 ```
@@ -100,7 +103,41 @@ var instances by remember { mutableStateOf(container.instanceManager.list()) }
 
 ---
 
-## 四、Java 运行时（内置 + 按需下载）
+## 四、首启与更新后的「补全依赖」
+
+APK 里带的 Java 运行时、LWJGL、渲染器都是 zip，必须先解压到私有目录才能用。
+不把这一步摊在用户面前，第一次点「开始游戏」只会看到
+`Cannot run program "java"` / `liblwjgl.so not found`，用户只会认为启动器是坏的。
+
+行为对齐 ZalithLauncher2：
+
+1. **首次启动**（或升级后组件版本变化）弹窗列出待解压清单 —— 体积、用途都写清楚；
+2. 点「安装」开始逐项解压，显示当前项与总体进度。**这一步不联网**；
+3. 装完写入「版本指纹」，下次启动直接跳过；
+4. 升级 APK 若带来新版组件，指纹变化 → 再次提示；
+5. 组件没补齐时点「开始游戏」会被拦下并重新叫出补全弹窗。
+
+```
+assets/runtime/<abi>/jre-<major>.zip   →  files/bundles/runtime/java-<major>/   (Java 按本机 ABI 只解一份)
+assets/bundle/<kind>/<name>.zip        →  files/bundles/bundle/<kind>/<name>/   (LWJGL / 渲染器等通用组件)
+```
+
+**清单来自磁盘扫描，不是写死的表**：包里没有的组件不会出现在弹窗里，
+所以「CI 没配 `JRE_ARCHIVES_URL` 打出的空包」也不会骗用户去点一个装不了的东西。
+`RuntimeManager` 直接使用已解压的 JRE，不会重复解压第二份。
+
+几个容易翻车的点都做了处理：
+
+| 场景 | 处理 |
+|---|---|
+| 解压到一半被系统杀进程 | 留 `.installing` 标记，下次启动清理半截目录，避免「显示已就绪、一启动就崩」|
+| 升级后同路径资产内容变了 | 资产缓存目录带 `versionCode + lastUpdateTime`，指纹必然变化，不会漏提示 |
+| 用户手动清了应用数据 | 记录没了但目录也没了 → 重新提示补全 |
+| 32 位机型包里带了 64 位 JRE | 按 `Build.SUPPORTED_ABIS` 只解本机架构，不会解错 |
+
+「设置 → 运行依赖」是常驻入口，能看到每项的状态、体积与来源路径，也能手动重新扫描。
+
+## 五、Java 运行时（内置 + 按需下载）
 
 Minecraft 对 Java 是硬依赖，class file version 不匹配直接 `UnsupportedClassVersionError`：
 
@@ -154,16 +191,16 @@ python3 scripts/package_runtimes.py --dir ./downloads --out app/src/main/assets 
 
 ---
 
-## 五、集成 PojavLauncher 内核
+## 六、集成 PojavLauncher 内核
 
-### 5.1 拉取源码
+### 6.1 拉取源码
 
 ```bash
 git submodule add https://github.com/PojavLauncherTeam/PojavLauncher.git pojav
 git -C pojav checkout v3_openjdk
 ```
 
-### 5.2 把内核模块接入构建
+### 6.2 把内核模块接入构建
 
 在 `settings.gradle.kts` 末尾追加：
 
@@ -183,7 +220,7 @@ implementation(project(":app_pojavlauncher"))
 > 但资源前缀不同，合并时若报 `resource duplicate` 需在 `:app` 的
 > `androidResources` / `packaging` 里排除冲突项。
 
-### 5.3 注册游戏 Activity
+### 6.3 注册游戏 Activity
 
 `app/src/main/AndroidManifest.xml` 里已留好占位，取消注释即可：
 
@@ -195,7 +232,7 @@ implementation(project(":app_pojavlauncher"))
           android:theme="@style/Theme.MizuLauncher.Game" />
 ```
 
-### 5.4 桥接层打通（关键一步）
+### 6.4 桥接层打通（关键一步）
 
 启动器把参数写成 JSON 放进 Intent：
 
@@ -218,7 +255,7 @@ if (cfg != null) {
 
 ---
 
-## 六、许可证与合规
+## 七、许可证与合规
 
 | 组件 | 许可 | 对我们的约束 |
 |---|---|---|
@@ -241,7 +278,7 @@ if (cfg != null) {
 
 ---
 
-## 七、下载加速说明
+## 八、下载加速说明
 
 镜像映射（`core/download/UrlRewriter.kt`）：
 
@@ -260,7 +297,7 @@ if (cfg != null) {
 
 ---
 
-## 八、CI
+## 九、CI
 
 `.github/workflows/build.yml`：
 
@@ -270,7 +307,7 @@ if (cfg != null) {
 
 ---
 
-## 九、已知限制
+## 十、已知限制
 
 - Forge/NeoForge 的 **processors（二进制补丁）不在手机上执行**，依赖 Pojav 内核运行期处理；
   极端老版本（1.7.10 之前）可能需要手工补库。
@@ -278,22 +315,28 @@ if (cfg != null) {
 - 微软登录用的 client id 是 Pojav 项目长期公开的那个；如需独立分发，请在 Azure 注册后
   通过 `MicrosoftAuth(clientId = "…")` 换掉。
 - 正版皮肤不单独下载，交给游戏内核处理。
-- 触屏按键布局编辑器可拖拽，但布局 JSON 持久化尚未接线（`LayoutStore` 待补）。
 - 内置 JRE 需要自行准备归档；仓库不附带二进制（体积 + 分发合规）。
+  没有内置资产时，首启不会弹补全框（没有可装的东西），Java 改为按需下载。
+- 应用内更新走 GitHub Release。国内直连 `api.github.com` 可能较慢；
+  查到的 Release 会落盘缓存，断网时仍能提示上次发现的新版本。
 
 ---
 
-## 十、路线图
+## 十一、路线图
 
-- [ ] 微软 OAuth 登录（device code flow）
-- [ ] 按键布局持久化 + 导入导出
+- [x] 微软 OAuth 登录（device code flow）
+- [x] 按键布局持久化（按横竖屏分别保存，可恢复默认）
+- [x] 首启 / 更新后补全依赖（对应 ZalithLauncher2 的组件解压流程）
+- [x] 应用内检查更新并直接安装
+- [x] 全局下载任务卡（离开下载页也能看进度、随时取消）
+- [ ] 按键布局导入/导出（分享给他人）
 - [ ] 模组/整合包（.mrpack、CurseForge zip）一键安装
 - [ ] 多实例并行下载队列
 - [ ] 崩溃自动分析（读 `crash-reports` 给结论）
 
 ---
 
-## 十一、致谢
+## 十二、致谢
 
 - [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher) — 启动内核（LGPL-3.0）
 - [Plain Craft Launcher 2](https://github.com/Hex-Dragon/PCL2) — 下载策略与镜像映射的参考

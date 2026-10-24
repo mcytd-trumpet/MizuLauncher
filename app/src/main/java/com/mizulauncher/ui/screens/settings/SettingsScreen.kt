@@ -62,6 +62,9 @@ fun SettingsScreen(
     onCheckUpdate: () -> Unit,
     onOpenAccount: () -> Unit,
     onOpenRuntime: () -> Unit,
+    /** 依赖补全结果摘要，例如「3 项待安装」 */
+    dependenciesSummary: String,
+    onOpenDependencies: () -> Unit,
     onOpenLogs: () -> Unit,
     onOpenAbout: () -> Unit,
     modifier: Modifier = Modifier
@@ -268,6 +271,13 @@ fun SettingsScreen(
                         subtitle = "预装 / 下载 Java 8、17、21、25",
                         icon = MizuIcons.Memory,
                         onClick = onOpenRuntime
+                    )
+                    SettingRow(
+                        title = "运行依赖补全",
+                        subtitle = dependenciesSummary,
+                        icon = MizuIcons.Extension,
+                        trailing = { Text("›") },
+                        onClick = onOpenDependencies
                     )
                     SettingRow(title = "运行日志", icon = MizuIcons.Log, onClick = onOpenLogs)
                     SettingRow(title = "关于 Mizu Launcher", icon = MizuIcons.Info, onClick = onOpenAbout)

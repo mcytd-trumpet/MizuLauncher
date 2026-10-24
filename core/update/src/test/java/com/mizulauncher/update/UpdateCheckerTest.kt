@@ -1,6 +1,7 @@
 package com.mizulauncher.update
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -140,6 +141,66 @@ class UpdateCheckerTest {
             deviceAbis = listOf("arm64-v8a")
         )
         assertNull("没有可下载 APK 时 asset 应为 null，UI 据此不给安装按钮", info?.asset)
+    }
+
+    @Test
+    fun `x86 device never gets an arm package`() {
+        val info = fakeCheck(
+            tagName = "v2.0.0",
+            assetNames = listOf(
+                "MizuLauncher-2.0.0-20000-arm64.apk",
+                "MizuLauncher-2.0.0-20000-x86.apk"
+            ),
+            currentCode = 10000,
+            deviceAbis = listOf("x86")
+        )
+        assertEquals("MizuLauncher-2.0.0-20000-x86.apk", info?.asset?.name)
+    }
+
+    @Test
+    fun `device abi reported so ui can explain the choice`() {
+        val info = fakeCheck(
+            tagName = "v2.0.0",
+            assetNames = listOf("MizuLauncher-2.0.0-20000-arm64.apk"),
+            currentCode = 10000,
+            deviceAbis = listOf("arm64-v8a", "armeabi-v7a")
+        )
+        assertEquals("arm64", info?.deviceAbi)
+        assertEquals("arm64", info?.asset?.abi)
+    }
+
+    @Test
+    fun `version code is read from asset name instead of tag`() {
+        // tag 写错成 2.0.0 但 versionCode 是 20005：以文件名里的为准确
+        assertEquals(20005, UpdateChecker.versionCodeFromName("MizuLauncher-2.0.0-20005-arm64.apk"))
+        assertEquals(10000, UpdateChecker.versionCodeFromName("MizuLauncher-1.0.0-10000-universal.apk"))
+        assertNull(UpdateChecker.versionCodeFromName("MizuLauncher-arm64.apk"))
+        assertNull(UpdateChecker.versionCodeFromName("SHA256SUMS.txt"))
+    }
+
+    @Test
+    fun `cached asset is reused when remote matches`() {
+        val json = """
+            {"tag_name":"v2.0.0","body":"","published_at":"","assets":[
+              {"name":"MizuLauncher-2.0.0-20000-arm64.apk","browser_download_url":"https://e/a.apk","size":1}
+            ]}
+        """.trimIndent()
+        val checker = UpdateChecker()
+        val hit = checker.parseRelease(json, 10000, "1.0.0", listOf("arm64-v8a"), "MizuLauncher-2.0.0-20000-arm64.apk")
+        assertTrue("同名包已在本机，应直接复用而不是重下", hit!!.reuseCached)
+
+        val miss = checker.parseRelease(json, 10000, "1.0.0", listOf("arm64-v8a"), "MizuLauncher-1.9.0-19900-arm64.apk")
+        assertFalse("旧包不能复用", miss!!.reuseCached)
+    }
+
+    @Test
+    fun `asset size is human readable`() {
+        val big = UpdateChecker.ReleaseAsset("a.apk", "u", 55L * 1024 * 1024)
+        val small = UpdateChecker.ReleaseAsset("b.apk", "u", 800L * 1024)
+        val unknown = UpdateChecker.ReleaseAsset("c.apk", "u", 0)
+        assertEquals("55.0 MB", big.sizeText)
+        assertEquals("800 KB", small.sizeText)
+        assertEquals("未知大小", unknown.sizeText)
     }
 
     // ---------------------------------------------------------------- 测试辅助

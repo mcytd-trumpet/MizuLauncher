@@ -128,6 +128,7 @@ dependencies {
     implementation(project(":core:runtime"))
     implementation(project(":core:auth"))
     implementation(project(":core:update"))
+    implementation(project(":core:setup"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

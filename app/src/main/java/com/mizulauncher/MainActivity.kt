@@ -24,19 +24,25 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.mizulauncher.ui.MainDestination
 import com.mizulauncher.ui.MainScaffold
 import com.mizulauncher.ui.SplashContent
+import com.mizulauncher.ui.components.DownloadTaskCard
 import com.mizulauncher.ui.components.GlassCard
+import com.mizulauncher.ui.components.formatEta
 import com.mizulauncher.ui.components.ProgressBlock
+import com.mizulauncher.ui.components.SetupDialog
 import com.mizulauncher.ui.components.UpdateDialog
 import com.mizulauncher.ui.screens.about.AboutScreen
 import com.mizulauncher.ui.screens.account.AccountScreen
 import com.mizulauncher.ui.screens.control.ControlEditorCanvas
 import com.mizulauncher.ui.screens.control.ControlLayout
+import com.mizulauncher.ui.screens.control.LayoutStore
+import com.mizulauncher.ui.screens.dependencies.DependenciesScreen
 import com.mizulauncher.ui.screens.download.DownloadScreen
 import com.mizulauncher.ui.screens.download.LoaderChoice
 import com.mizulauncher.ui.screens.download.formatSpeed
@@ -61,7 +67,17 @@ fun App() {
     var splashProgress by remember { mutableStateOf(0f) }
     var splashText by remember { mutableStateOf("正在扫描实例目录…") }
 
-    var darkSetting by remember { mutableStateOf<Boolean?>(null) }
+    // 主题偏好必须持久化，否则用户在设置里选的深色模式重启就回到跟随系统
+    val prefs = (LocalContext.current.applicationContext as MizuApplication).container.settings
+    var darkSetting by remember {
+        mutableStateOf(
+            when (prefs.themeMode) {
+                "dark" -> true
+                "light" -> false
+                else -> null
+            }
+        )
+    }
     val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
     val dark = darkSetting ?: systemDark
 
@@ -79,7 +95,17 @@ fun App() {
         if (showSplash) {
             SplashContent(progress = splashProgress, status = splashText)
         } else {
-            AppContent(onThemeChange = { darkSetting = it })
+            AppContent(
+                darkMode = darkSetting,
+                onThemeChange = { value ->
+                    darkSetting = value
+                    prefs.themeMode = when (value) {
+                        true -> "dark"
+                        false -> "light"
+                        null -> "system"
+                    }
+                }
+            )
         }
     }
 }
@@ -93,7 +119,7 @@ fun App() {
  * 任何写操作结束都会主动 [LauncherViewModel.refreshInstances]，UI 立刻反映。
  */
 @Composable
-private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
+private fun AppContent(darkMode: Boolean?, onThemeChange: (Boolean?) -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current.applicationContext
     val container = (context as MizuApplication).container
     val config = LocalConfiguration.current
@@ -116,12 +142,36 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
     val updateChecking by vm.updateChecking.collectAsStateWithLifecycle()
     val updateProgress by vm.updateProgress.collectAsStateWithLifecycle()
     val updateStatus by vm.updateStatus.collectAsStateWithLifecycle()
+    val updateDownloading by vm.updateDownloading.collectAsStateWithLifecycle()
+    val updateToast by vm.updateToast.collectAsStateWithLifecycle()
     val downloadedApk by vm.downloadedApk.collectAsStateWithLifecycle()
+    val bundleItems by vm.bundleItems.collectAsStateWithLifecycle()
+    val bundlePending by vm.bundlePending.collectAsStateWithLifecycle()
+    val bundleStates by vm.bundleStates.collectAsStateWithLifecycle()
+    val bundlePhase by vm.bundlePhase.collectAsStateWithLifecycle()
+    val setupDismissed by vm.setupDismissed.collectAsStateWithLifecycle()
+    val bundleNotice by vm.bundleNotice.collectAsStateWithLifecycle()
     val runtimeStates by vm.runtimeStates.collectAsStateWithLifecycle()
     val profile by vm.profile.collectAsStateWithLifecycle()
 
     // 启动时静默续期一次：令牌快过期就刷新，失败不打扰用户
     LaunchedEffect(Unit) { vm.refreshAccountIfNeeded() }
+    // 扫描内置组件：首启或升级后若有未解压的，弹窗让用户补全
+    LaunchedEffect(Unit) { vm.rescanBundles() }
+
+    // 一次性提示（依赖补全结果 / 检查更新结果）走 Toast，不打断操作
+    LaunchedEffect(bundleNotice) {
+        bundleNotice?.let {
+            android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_SHORT).show()
+            vm.consumeBundleNotice()
+        }
+    }
+    LaunchedEffect(updateToast) {
+        updateToast?.let {
+            android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_SHORT).show()
+            vm.consumeUpdateToast()
+        }
+    }
     // 启动时静默查一次更新；有新版才弹窗，没网/查失败不打扰
     LaunchedEffect(Unit) { vm.checkForUpdate(manual = false) }
     val deviceCode by vm.deviceCode.collectAsStateWithLifecycle()
@@ -143,10 +193,18 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
         }
     }
 
-    // 控制编辑器（纯 UI 态，不需要跨页面存活）
+    // 控制编辑器。布局必须落盘：以前只放 remember 里，退出就丢
+    val orientationKey = if (config.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) "landscape" else "portrait"
+    val layoutStore = remember { LayoutStore(container.rootDir) }
     var showControlEditor by remember { mutableStateOf(false) }
-    var layout by remember { mutableStateOf(ControlLayout()) }
+    var layout by remember(orientationKey) { mutableStateOf(layoutStore.load(orientationKey)) }
     var selectedWidget by remember { mutableStateOf<String?>(null) }
+
+    /** 任何改动都立刻落盘，避免「编辑半天、切个页面就没了」 */
+    fun persistLayout(next: ControlLayout) {
+        layout = next
+        layoutStore.save(orientationKey, next)
+    }
 
     val selected = instances.firstOrNull { it.id == selectedId }
 
@@ -178,6 +236,9 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
     // 进入运行时页时重新扫一次磁盘，保证显示的是最新的
     LaunchedEffect(destination) {
         if (destination == MainDestination.RUNTIME) vm.refreshRuntimes()
+    }
+    LaunchedEffect(destination) {
+        if (destination == MainDestination.DEPENDENCIES) vm.rescanBundles()
     }
 
     Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
@@ -247,6 +308,17 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     modifier = modifier
                 )
 
+                MainDestination.DEPENDENCIES -> DependenciesScreen(
+                    items = bundleItems,
+                    pending = bundlePending,
+                    states = bundleStates,
+                    phase = bundlePhase,
+                    abi = RuntimeManager.primaryAbi(),
+                    onInstall = { vm.installBundles() },
+                    onRescan = { vm.rescanBundles() },
+                    modifier = modifier
+                )
+
                 MainDestination.RUNTIME -> RuntimeScreen(
                     states = runtimeStates,
                     abi = RuntimeManager.primaryAbi(),
@@ -260,7 +332,7 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     threads = settings.downloadThreads,
                     memoryMb = settings.maxMemoryMb,
                     renderer = com.mizulauncher.bridge.Renderer.valueOf(settings.renderer),
-                    darkMode = null,
+                    darkMode = darkMode,
                     backgroundPath = settings.backgroundPath,
                     runtimeManifestUrl = settings.runtimeManifestUrl ?: "",
                     accountName = accountName,
@@ -285,6 +357,12 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     onOpenControlEditor = { showControlEditor = true },
                     onOpenAccount = { destination = MainDestination.ACCOUNT },
                     onOpenRuntime = { destination = MainDestination.RUNTIME },
+                    dependenciesSummary = when {
+                        bundleItems.isEmpty() -> "当前安装包无内置组件"
+                        bundlePending.isEmpty() -> "全部就绪（${bundleItems.size} 项）"
+                        else -> "${bundlePending.size} 项待补全"
+                    },
+                    onOpenDependencies = { destination = MainDestination.DEPENDENCIES },
                     updateChecking = updateChecking,
                     updateStatus = updateStatus,
                     onCheckUpdate = { vm.checkForUpdate(manual = true) },
@@ -303,6 +381,9 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     versionName = BuildConfig.VERSION_NAME,
                     versionCode = BuildConfig.VERSION_CODE,
                     bridgeInfo = vm.orchestrator.bridge?.info,
+                    updateChecking = updateChecking,
+                    updateStatus = updateStatus,
+                    onCheckUpdate = { vm.checkForUpdate(manual = true) },
                     onOpenSource = { url ->
                         runCatching {
                             context.startActivity(
@@ -318,11 +399,32 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
             }
         }
 
+        // 全局下载任务卡：离开下载页后仍能看到进度、随时取消
+        // 只在真有下载任务时显示：启动游戏也会把 installing 置位，
+        // 但那时候没有 totalTasks，弹一张「0% 准备中」的卡片纯属误导
+        val hasDownloadTask = installing && progress.totalTasks > 0
+        if (hasDownloadTask && destination != MainDestination.DOWNLOAD) {
+            DownloadTaskCard(
+                title = selected?.name ?: "正在准备",
+                percent = progress.percent,
+                stage = progress.stage.ifBlank { stage.ifBlank { "准备中" } },
+                detail = progress.currentFile,
+                speedText = if (progress.speedBps > 0) formatSpeed(progress.speedBps) else null,
+                etaText = formatEta(progress.etaSeconds),
+                fileCountText = if (progress.totalTasks > 0) "${progress.doneTasks}/${progress.totalTasks}" else null,
+                onCancel = { vm.cancelDownload() },
+                onOpen = { destination = MainDestination.DOWNLOAD },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(12.dp)
+            )
+        }
+
         // 更新提示：三种状态共用一个弹窗
         updateInfo?.let { info ->
             UpdateDialog(
                 info = info,
-                downloading = updateStatus == "正在下载…",
+                downloading = updateDownloading,
                 progress = updateProgress,
                 readyToInstall = downloadedApk != null,
                 status = updateStatus,
@@ -332,6 +434,17 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     downloadedApk?.let { installApk(context, it) }
                 },
                 onDismiss = { vm.dismissUpdate() }
+            )
+        }
+
+        // 补全运行依赖：首启 / 升级后 / 点启动被拦下时出现
+        if (bundlePending.isNotEmpty() && !setupDismissed) {
+            SetupDialog(
+                items = bundlePending,
+                states = bundleStates,
+                phase = bundlePhase,
+                onInstall = { vm.installBundles() },
+                onDismiss = { vm.dismissSetup() }
             )
         }
 
@@ -369,15 +482,21 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                 selectedId = selectedWidget,
                 onSelect = { selectedWidget = it },
                 onMove = { id, x, y ->
-                    layout = layout.copy(
-                        layers = layout.layers.map { layer ->
-                            layer.copy(widgets = layer.widgets.map {
-                                if (it.id == id) it.copy(x = x, y = y) else it
-                            })
-                        }
+                    persistLayout(
+                        layout.copy(
+                            layers = layout.layers.map { layer ->
+                                layer.copy(widgets = layer.widgets.map {
+                                    if (it.id == id) it.copy(x = x, y = y) else it
+                                })
+                            }
+                        )
                     )
                 },
-                onClose = { showControlEditor = false }
+                onReset = { persistLayout(layoutStore.reset(orientationKey)) },
+                onClose = {
+                    showControlEditor = false
+                    layoutStore.save(orientationKey, layout)
+                }
             )
         }
 
@@ -398,7 +517,9 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                             percent = if (progress.percent > 0) progress.percent else 0,
                             stage = progress.stage.ifBlank { stage.ifBlank { "准备中" } },
                             detail = progress.currentFile,
-                            speedText = formatSpeed(progress.speedBps)
+                            speedText = if (progress.speedBps > 0) formatSpeed(progress.speedBps) else null,
+                            etaText = formatEta(progress.etaSeconds),
+                            fileCountText = if (progress.totalTasks > 0) "${progress.doneTasks}/${progress.totalTasks}" else null
                         )
                     }
                 }
@@ -413,6 +534,7 @@ private fun ControlEditorFullscreen(
     selectedId: String?,
     onSelect: (String?) -> Unit,
     onMove: (String, Float, Float) -> Unit,
+    onReset: () -> Unit,
     onClose: () -> Unit
 ) {
     Box(Modifier.fillMaxSize().background(Color(0xFF0E1013))) {
@@ -430,6 +552,12 @@ private fun ControlEditorFullscreen(
                 .align(Alignment.TopEnd)
                 .padding(16.dp)
         ) { Text("完成") }
+        androidx.compose.material3.OutlinedButton(
+            onClick = onReset,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(16.dp)
+        ) { Text("恢复默认布局") }
     }
 }
 

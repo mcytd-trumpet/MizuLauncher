@@ -46,6 +46,7 @@ enum class MainDestination(val label: String, val icon: ImageVector) {
     /** 以下几项不进底栏，仅由设置页 / 首页头像跳转 */
     ACCOUNT("账户", MizuIcons.Person),
     RUNTIME("Java 运行时", MizuIcons.Memory),
+    DEPENDENCIES("运行依赖", MizuIcons.Extension),
     LOGS("运行日志", MizuIcons.Log),
     ABOUT("关于", MizuIcons.Info);
 
