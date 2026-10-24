@@ -1,0 +1,35 @@
+# Android / Gradle
+*.iml
+.gradle
+.idea
+.kotlin
+/build
+/app/build
+/core/*/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# 内置 JRE 归档体积大、且有各自的上游许可，不入库
+/app/src/main/assets/runtime/
+.jre-cache/
+out/
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode/
+
+# 敏感信息
+.oauth_client_id.txt
+.store_password.txt
+.key_password.txt
+.curseforge_api.txt
+

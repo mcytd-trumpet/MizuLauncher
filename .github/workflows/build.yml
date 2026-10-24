@@ -1,0 +1,251 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: >-
+    -Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g
+    -Dorg.gradle.parallel=true
+    -Dorg.gradle.caching=true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 决定这次发布的版本号
+  #
+  #    应用内更新靠 versionCode 判断新旧，所以每次往 main 推代码都要自动加一，
+  #    否则新包推上去用户那边永远不会提示更新。
+  #    规则：取最近 tag 的版本，patch + 1；打 tag 时直接用 tag 里的版本。
+  # ---------------------------------------------------------------------------
+  version:
+    name: 计算版本号
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.ver.outputs.name }}
+      code: ${{ steps.ver.outputs.code }}
+      publish: ${{ steps.ver.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: ver
+        name: 从 tag 推导版本
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            name="${GITHUB_REF#refs/tags/v}"
+            echo "▶ 手动 tag 发布：$name"
+          else
+            last=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+            if [[ -z "$last" ]]; then
+              name="1.0.0"
+            else
+              base="${last#v}"
+              major=$(echo "$base" | cut -d. -f1)
+              minor=$(echo "$base" | cut -d. -f2); minor="${minor:-0}"
+              patch=$(echo "$base" | cut -d. -f3); patch="${patch%%-*}"; patch="${patch:-0}"
+              name="$major.$minor.$((patch + 1))"
+            fi
+            echo "▶ main 自动发布：$name（上一个 tag：${last:-无}）"
+          fi
+
+          # versionCode = major*10000 + minor*100 + patch，单调递增，
+          # 与应用内 UpdateChecker.versionCodeFromTag 的算法保持一致
+          major=$(echo "$name" | cut -d. -f1)
+          minor=$(echo "$name" | cut -d. -f2); minor="${minor:-0}"
+          patch=$(echo "$name" | cut -d. -f3); patch="${patch%%-*}"; patch="${patch:-0}"
+          code=$(( 10#$major * 10000 + 10#$minor * 100 + 10#$patch ))
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "▶ versionName=$name versionCode=$code"
+
+  # ---------------------------------------------------------------------------
+  # 2. 单元测试 + 五个 ABI 变体全量编译
+  #    JRE 资源默认缺席 —— 缺失时构建必须**依然成功**，只是 APK 里没有预装 Java。
+  #    这条是硬要求：不能让「没配 Secret」变成「打不出包」。
+  # ---------------------------------------------------------------------------
+  build:
+    name: 测试与编译
+    needs: version
+    if: always() && (needs.version.result == 'success' || needs.version.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 配置 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 配置 Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 单元测试
+        run: ./gradlew test --stacktrace
+
+      - name: 校验调试 API 文档与代码一致
+        # 调试文档最容易烂的方式是只改一边。这条会在「代码加了接口没写文档」
+        # 或「文档写了接口没实现」时直接失败。
+        run: python3 scripts/check_api_doc.py
+
+      - name: 下载并打包内置 JRE（可选）
+        # 只有配了 JRE_ARCHIVES_URL 才执行；没配就跳过，APK 里不含预装 Java，
+        # 运行时会走远端清单按需下载。
+        if: ${{ vars.JRE_ARCHIVES_URL != '' }}
+        env:
+          JRE_ARCHIVES_URL: ${{ vars.JRE_ARCHIVES_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p .jre-cache
+          echo "从 $JRE_ARCHIVES_URL 下载 JRE 归档…"
+          if [[ "$JRE_ARCHIVES_URL" == *.json ]]; then
+            curl -fsSL "$JRE_ARCHIVES_URL" -o .jre-cache/index.json
+            python3 - <<'EOF'
+          import json, subprocess
+          idx = json.load(open('.jre-cache/index.json'))
+          for f in idx.get('files', []):
+              name = f['url'].rsplit('/', 1)[-1]
+              subprocess.check_call(['curl', '-fsSL', f['url'], '-o', f'.jre-cache/{name}'])
+          EOF
+          else
+            curl -fsSL "$JRE_ARCHIVES_URL" -o .jre-cache/bundle.tar.gz
+            tar -xzf .jre-cache/bundle.tar.gz -C .jre-cache
+          fi
+          python3 scripts/package_runtimes.py \
+            --dir .jre-cache --out app/src/main/assets \
+            --manifest .jre-cache/jre-index.json
+          du -sh app/src/main/assets/runtime/* 2>/dev/null || true
+
+      - name: 编译五个 ABI 变体
+        env:
+          VNAME: ${{ needs.version.outputs.name }}
+          VCODE: ${{ needs.version.outputs.code }}
+        run: |
+          set -euo pipefail
+          # PR 场景 version job 被跳过，用默认版本号
+          ARGS=""
+          if [[ -n "${VNAME:-}" && -n "${VCODE:-}" ]]; then
+            ARGS="-Pmizu.versionName=${VNAME} -Pmizu.versionCode=${VCODE}"
+          fi
+          ./gradlew \
+            :app:assembleArm32Release \
+            :app:assembleArm64Release \
+            :app:assembleX86Release \
+            :app:assembleX64Release \
+            :app:assembleUniversalRelease \
+            $ARGS --stacktrace
+
+      - name: 重命名产物
+        env:
+          VNAME: ${{ needs.version.outputs.name }}
+          VCODE: ${{ needs.version.outputs.code }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          name="${VNAME:-1.0.0}"
+          code="${VCODE:-10000}"
+          for abi in arm32 arm64 x86 x64 universal; do
+            src=$(find app/build/outputs/apk/$abi/release -name '*.apk' | head -1)
+            # 文件名编入 versionCode：应用内更新靠它判断新旧，
+            # 比从 tag 字符串猜版本可靠
+            cp "$src" "artifacts/MizuLauncher-${name}-${code}-${abi}.apk"
+          done
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apks
+          path: artifacts/*.apk
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3. 发布：main 每次推送都发 Release
+  #    没有这一步，应用内「检查更新」永远查不到新版本。
+  # ---------------------------------------------------------------------------
+  release:
+    name: 发布
+    needs: [version, build]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: apks
+          path: artifacts
+
+      - name: 生成校验文件
+        run: |
+          cd artifacts
+          sha256sum *.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VNAME: ${{ needs.version.outputs.name }}
+          VCODE: ${{ needs.version.outputs.code }}
+          SHA: ${{ github.sha }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          set -euo pipefail
+          tag="v${VNAME}"
+          # main 推送时自动打 tag，让「latest」永远指向最新构建
+          if [[ "$IS_TAG" != "true" ]]; then
+            git tag -f "$tag" "$SHA" 2>/dev/null || true
+            git push -f origin "refs/tags/$tag" || true
+          fi
+
+          cat > notes.md <<EOF
+          ## 安装说明
+
+          按手机 CPU 架构选一个装，装错了会闪退（JRE 与原生库都按架构编译）：
+
+          | 文件 | 适用设备 |
+          |---|---|
+          | \`-arm64.apk\` | 绝大多数 2017 年后的安卓手机（推荐） |
+          | \`-arm32.apk\` | 老旧 32 位 ARM 设备（无 Java 25） |
+          | \`-x64.apk\` | 模拟器 / x86 平板 |
+          | \`-x86.apk\` | 32 位 x86 模拟器（无 Java 25） |
+          | \`-universal.apk\` | 不确定架构时装这个（体积最大） |
+
+          也可以直接在应用内点「检查更新」自动下载安装，不用手动挑包。
+
+          - versionName: \`${VNAME}\`
+          - versionCode: \`${VCODE}\`
+          - commit: \`${SHA}\`
+          EOF
+
+          # 已存在同名 release 就覆盖资源，避免重复发布报 422
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/*.apk artifacts/SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" \
+              --title "Mizu Launcher ${VNAME}" \
+              --notes-file notes.md \
+              artifacts/*.apk artifacts/SHA256SUMS.txt
+          fi
