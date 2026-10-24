@@ -1,0 +1,11 @@
+{
+  "_comment": "MizuLauncher 2.0 内置 Java 运行时清单。打包脚本 scripts/package_runtimes.py 会重写 entries；本文件只声明'期望内置哪些'，实际是否打进 APK 取决于构建时资产的真实存在。",
+  "_schema": "entries[].{major,abi,url,sha1,size}；url 为空字符串表示'由 APK 内置，不走网络'",
+  "version": 2,
+  "generatedBy": "MizuLauncher 2.0",
+  "expected": {
+    "majors": [8, 17, 21, 25],
+    "abis": ["arm64-v8a", "armeabi-v7a", "x86", "x86_64"]
+  },
+  "entries": []
+}

@@ -121,6 +121,13 @@ android {
 }
 
 dependencies {
+    // 2.0 新增
+    implementation(project(":core:compat"))
+    implementation(project(":core:auth-yggdrasil"))
+    implementation(project(":core:skin"))
+    implementation(project(":core:web"))
+    implementation(project(":ui:design"))
+
     implementation(project(":core:download"))
     implementation(project(":core:minecraft"))
     implementation(project(":core:instance"))

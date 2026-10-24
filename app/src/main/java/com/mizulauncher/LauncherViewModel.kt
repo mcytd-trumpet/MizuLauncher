@@ -211,7 +211,7 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
      */
     init {
         // 调试 API 优先起：它是外部依赖，越早可用越好，且开销极小
-        DebugApiHost.attach(this)
+        DebugApiHost.attach(asDebugBridge, getApplication())
 
         viewModelScope.launch(Dispatchers.IO) {
             refreshInstances()

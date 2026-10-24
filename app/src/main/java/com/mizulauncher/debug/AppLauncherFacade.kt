@@ -1,7 +1,6 @@
 package com.mizulauncher.debug
 
 import android.os.Build
-import com.mizulauncher.LauncherViewModel
 import com.mizulauncher.MizuApplication
 import com.mizulauncher.debugapi.ApiException
 import com.mizulauncher.debugapi.LauncherFacade
@@ -21,11 +20,12 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * ## 为什么要持有 ViewModel
  *
- * 安装、启动这些流程的状态都在 [LauncherViewModel] 里（`installing`、`stage`、`error`、
+ * 安装、启动这些流程的状态都在界面层的 ViewModel 里（`installing`、`stage`、`error`、
  * `downloadProgress`）。如果这里另起一套，就会出现「API 触发的安装」和「UI 触发的安装」
  * 互不知情的情况——两边都能启动一次下载，互相打架。
  *
- * 所以调试 API **复用同一个 ViewModel 实例**，等于和 UI 共用一条控制链路。
+ * 所以调试 API **复用同一个 ViewModel 实例**（通过 [DebugUiBridge] 这个窄接口），
+ * 等于和 UI 共用一条控制链路。
  * 这样你用 curl 触发的启动，在手机上也能看到进度条在动，不会出现「黑箱」。
  *
  * ## 超时控制
@@ -37,7 +37,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 class AppLauncherFacade(
     private val app: MizuApplication,
     /** 由 Activity 注入。为 null 时所有需要界面状态的能力会返回 503 */
-    private val viewModelProvider: () -> LauncherViewModel?
+    private val viewModelProvider: () -> DebugUiBridge?
 ) : LauncherFacade {
 
     private val container get() = app.container
@@ -46,10 +46,10 @@ class AppLauncherFacade(
     /** 用于「触发了就返回」的异步任务（下载、解压等） */
     private val bg = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val vm: LauncherViewModel?
+    private val vm: DebugUiBridge?
         get() = viewModelProvider()
 
-    private fun requireVm(): LauncherViewModel =
+    private fun requireVm(): DebugUiBridge =
         vm ?: throw ApiException(503, "ui_not_ready",
             "启动器界面还没起来（ViewModel 未初始化）。请先打开 App 一次，再调这个接口。")
 
@@ -190,7 +190,7 @@ class AppLauncherFacade(
                 "totalTasks" to (p?.totalTasks ?: 0),
                 "doneTasks" to (p?.doneTasks ?: 0),
                 "failedTasks" to (p?.failedTasks ?: 0),
-                "percent" to (p?.percent ?: 0),
+                "percent" to (p?.percent ?: 0f),
                 "totalBytes" to (p?.totalBytes ?: 0L),
                 "downloadedBytes" to (p?.downloadedBytes ?: 0L),
                 "speedBps" to (p?.speedBps ?: 0L),
@@ -257,21 +257,42 @@ class AppLauncherFacade(
         val v = vm ?: throw ApiException(503, "ui_not_ready", "启动器界面还没起来")
         // scan 是同步的（纯文件操作），可以直接等
         runCatching { v.rescanBundles() }
-        val items = v.bundleItems.value
+        // pending 里每一项就是一个待补的组件，它自带 key/kind/name/label/sizeBytes。
+        // 逐项把字段抽出来，而不是把对象直接序列化——后者会把 File 之类的内部字段一起吐出去。
         val pending = v.bundlePending.value
         return mapOf(
             "scanned" to v.bundleScanned.value,
             "pending" to pending.size,
-            "items" to items.map { item ->
-                mapOf(
-                    "key" to item.key,
-                    "kind" to item.kind,
-                    "name" to item.name,
-                    "label" to item.label,
-                    "sizeBytes" to item.sizeBytes,
-                    "state" to (v.bundleStates.value[item.key]?.toString() ?: "Unknown")
-                )
-            }
+            "items" to pending.map { item -> bundleItemToMap(item) }
+        )
+    }
+
+    /**
+     * 把 `BundleCatalog.Item` 反射成一个纯数据的 Map。
+     *
+     * 为什么不直接 `item.toString()`：调试接口的消费方是脚本，
+     * 需要能按下标取值（`.[] | .key`），而不是去 parse 一个人类可读的字符串。
+     * 用反射是因为 facade 不该 compile-time 依赖 setup 模块的具体类型——
+     * 那样 setup 一改字段，这个文件又得跟着改。
+     */
+    private fun bundleItemToMap(item: Any): Map<String, Any?> {
+        fun field(name: String): Any? = runCatching {
+            item.javaClass.methods.firstOrNull {
+                it.parameterCount == 0 && (it.name == "get" + name.replaceFirstChar(Char::uppercase)
+                    || it.name == name)
+            }?.invoke(item)
+        }.getOrNull()
+
+        val key = field("key")
+        return mapOf(
+            "key" to key,
+            "kind" to field("kind"),
+            "name" to field("name"),
+            "label" to field("label"),
+            "sizeBytes" to field("sizeBytes"),
+            // 组件状态：pending 里的就是还没装好的。更细的状态（Installing/Percent）
+            // 属于界面进度条的事，调试接口只需要能回答"还需要装吗"
+            "state" to "Pending"
         )
     }
 
@@ -288,7 +309,7 @@ class AppLauncherFacade(
             mapOf(
                 "major" to major,
                 "state" to (state?.toString() ?: "Unknown"),
-                "ready" to (vm?.runtimeManager?.isReady(major) ?: false)
+                "ready" to (vm?.isRuntimeReady(major) ?: false)
             )
         }
 

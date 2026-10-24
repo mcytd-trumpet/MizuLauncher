@@ -20,7 +20,7 @@ import java.io.File
  *   └── cache/                       版本清单缓存 / 下载临时文件
  * ```
  */
-class AppContainer(context: Context) {
+class AppContainer(private val context: Context) {
 
     val rootDir: File = File(context.getExternalFilesDir(null) ?: context.filesDir, "MizuLauncher").apply { mkdirs() }
     val cacheDir: File = File(rootDir, "cache").apply { mkdirs() }
@@ -35,6 +35,31 @@ class AppContainer(context: Context) {
      * 放在容器里统一持有，避免各自维护一份导致换源后行为不一致。
      */
     val sourceFlow = kotlinx.coroutines.flow.MutableStateFlow(settings.downloadSource)
+
+    /**
+     * 内置组件解压器（首启「补全依赖」）。
+     *
+     * 放在容器里而不是各 ViewModel 自建：原来 LauncherViewModel 内部 new 了一个，
+     * 2.0 的 MizuViewModel 如果也 new 一个，两套就会各自扫描、各自解压同一批 zip，
+     * 导致「刚解压完又被当成未安装」这种诡异现象。
+     */
+    val bundleInstaller: com.mizulauncher.setup.BundleInstaller by lazy {
+        com.mizulauncher.setup.BundleInstaller(context)
+    }
+
+    /**
+     * Java 运行时管理器。
+     *
+     * 同样收进容器：它持有状态表（states），多处各建一份会让 UI 显示的进度与实际下载脱节。
+     */
+    val runtimeManager: com.mizulauncher.runtime.RuntimeManager by lazy {
+        com.mizulauncher.runtime.RuntimeManager(
+            context = context,
+            sourceFlow = sourceFlow,
+            manifestUrlProvider = { settings.runtimeManifestUrl },
+            extractedRootProvider = { File(bundleInstaller.installRoot, "runtime") }
+        )
+    }
 
     /** 账户会话：微软正版登录 + 令牌续期 + 持久化 */
     val accountSession: AccountSession = AccountSession(
@@ -84,6 +109,17 @@ class SettingsStore(context: Context) {
         set(value) = prefs.edit().putString(KEY_BG, value).apply()
 
     /**
+     * 是否启用 Material You 动态取色。
+     *
+     * 独立开关而不是"有就自动用"：动态取色的结果由壁纸决定，
+     * 有些壁纸提取出来的主色饱和度极低，界面会显得脏。
+     * 让用户能关掉，比强行帮他决定好。
+     */
+    var dynamicColor: Boolean
+        get() = prefs.getBoolean(KEY_DYNAMIC_COLOR, false)
+        set(value) = prefs.edit().putBoolean(KEY_DYNAMIC_COLOR, value).apply()
+
+    /**
      * Java 运行时远端清单地址（jre-index.json）。
      * 留空则只用 APK 内置的运行时；填写后可用于补齐未内置的版本（如 32 位的 Java 25）。
      */
@@ -106,6 +142,7 @@ class SettingsStore(context: Context) {
         const val KEY_BG = "background_path"
         const val KEY_RUNTIME_MANIFEST = "runtime_manifest_url"
         const val KEY_ACCOUNT_JSON = "account_json"
+        const val KEY_DYNAMIC_COLOR = "dynamic_color"
     }
 }
 

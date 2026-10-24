@@ -15,10 +15,12 @@ local.properties
 *.jks
 *.keystore
 
-# 内置 JRE 归档体积大、且有各自的上游许可，不入库
+# 内置 JRE 归档体积大、且有各自的上游许可，不入库（策略见 runtimes/README.md）
 /app/src/main/assets/runtime/
+*.tar.gz
 .jre-cache/
 out/
+**/build/
 
 # 系统垃圾
 .DS_Store

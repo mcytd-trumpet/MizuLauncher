@@ -50,7 +50,7 @@
         </provider>
 
         <activity
-            android:name=".MainActivity"
+            android:name=".v2.MainActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density"
             android:windowSoftInputMode="adjustResize">

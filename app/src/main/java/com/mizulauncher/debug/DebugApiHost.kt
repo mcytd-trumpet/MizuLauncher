@@ -2,7 +2,6 @@ package com.mizulauncher.debug
 
 import android.content.Context
 import android.util.Log
-import com.mizulauncher.LauncherViewModel
 import com.mizulauncher.MizuApplication
 import com.mizulauncher.debugapi.DebugApiServer
 import java.lang.ref.WeakReference
@@ -38,7 +37,7 @@ object DebugApiHost {
     @Volatile
     private var server: DebugApiServer? = null
 
-    private var vmRef: WeakReference<LauncherViewModel>? = null
+    private var vmRef: WeakReference<DebugUiBridge>? = null
 
     /** 持有 app 引用以便随时重建 facade（facade 每次重启服务时新建） */
     @Volatile
@@ -53,9 +52,8 @@ object DebugApiHost {
      * 实际使用时大部分人会把调试口长期开着——那反而更糟。
      */
     @Synchronized
-    fun attach(vm: LauncherViewModel) {
+    fun attach(vm: DebugUiBridge, application: MizuApplication) {
         vmRef = WeakReference(vm)
-        val application = vm.getApplication<MizuApplication>()
         app = application
 
         if (server?.isRunning == true) return
