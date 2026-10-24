@@ -10,6 +10,8 @@ import com.mizulauncher.auth.TokenPoll
 import com.mizulauncher.bridge.LaunchOptions
 import com.mizulauncher.bridge.LaunchResult
 import com.mizulauncher.bridge.Renderer
+import com.mizulauncher.update.ApkDownloader
+import com.mizulauncher.update.UpdateChecker
 import com.mizulauncher.download.DownloadProgress
 import com.mizulauncher.download.DownloadSource
 import com.mizulauncher.instance.InstanceMeta
@@ -343,6 +345,103 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
             val valid = withContext(Dispatchers.IO) { container.accountSession.valid() }
             _profile.value = valid
         }
+    }
+
+
+    // ---------------- 应用更新 ----------------
+
+    private val updateChecker = UpdateChecker(http = okhttp3.OkHttpClient.Builder().build())
+    private val apkDownloader = ApkDownloader()
+
+    private val _update = MutableStateFlow<UpdateChecker.UpdateInfo?>(null)
+    val update: StateFlow<UpdateChecker.UpdateInfo?> = _update.asStateFlow()
+
+    private val _updateChecking = MutableStateFlow(false)
+    val updateChecking: StateFlow<Boolean> = _updateChecking.asStateFlow()
+
+    private val _updateProgress = MutableStateFlow(0)
+    val updateProgress: StateFlow<Int> = _updateProgress.asStateFlow()
+
+    private val _updateStatus = MutableStateFlow<String?>(null)
+    val updateStatus: StateFlow<String?> = _updateStatus.asStateFlow()
+
+    /** -1 表示当前设备找不到可下载的包 */
+    private val _downloadedApk = MutableStateFlow<java.io.File?>(null)
+    val downloadedApk: StateFlow<java.io.File?> = _downloadedApk.asStateFlow()
+
+    private var updateJob: Job? = null
+
+    /**
+     * 检查更新。
+     *
+     * `versionCode` 取自 BuildConfig，Release 资源名里也带同一个数，
+     * 两边对得上才不会误报「有新版本」。
+     */
+    fun checkForUpdate(manual: Boolean = false) {
+        if (_updateChecking.value) return
+        viewModelScope.launch {
+            _updateChecking.value = true
+            if (manual) _updateStatus.value = "正在检查更新…"
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    updateChecker.checkForUpdate(
+                        currentVersionCode = BuildConfig.VERSION_CODE,
+                        currentVersionName = BuildConfig.VERSION_NAME,
+                        deviceAbis = android.os.Build.SUPPORTED_ABIS.toList()
+                    )
+                }
+            }
+            _updateChecking.value = false
+            result.onSuccess { info ->
+                _update.value = info
+                _updateStatus.value = when {
+                    info == null && manual -> "已是最新版本"
+                    info == null -> null
+                    info.asset == null -> "发现新版本 ${info.versionName}，但没有匹配本机架构的安装包"
+                    else -> null
+                }
+            }.onFailure {
+                _updateStatus.value = if (manual) "检查更新失败：${it.message}" else null
+            }
+        }
+    }
+
+    /** 下载更新包，完成后 UI 调 [installUpdate] 拉起系统安装器 */
+    fun downloadUpdate() {
+        val info = _update.value ?: return
+        val asset = info.asset ?: return
+        if (_downloadedApk.value != null) return
+        updateJob?.cancel()
+        updateJob = viewModelScope.launch {
+            _updateProgress.value = 0
+            _updateStatus.value = "正在下载…"
+            val dir = java.io.File(getApplication<Application>().cacheDir, "updates").apply { mkdirs() }
+            // 固定文件名，方便断点续传；URL 里带了版本号，换了版本自然换文件
+            val target = java.io.File(dir, "MizuLauncher-${info.versionName}-${asset.name.substringAfterLast('-')}")
+            val result = apkDownloader.download(asset.url, target) { p ->
+                _updateProgress.value = p.percent
+            }
+            result.onSuccess { file ->
+                _downloadedApk.value = file
+                _updateStatus.value = "下载完成"
+            }.onFailure {
+                _updateStatus.value = "下载失败：${it.message}"
+                _updateProgress.value = 0
+            }
+        }
+    }
+
+    fun cancelUpdateDownload() {
+        updateJob?.cancel()
+        _updateProgress.value = 0
+        _updateStatus.value = null
+    }
+
+    fun dismissUpdate() {
+        _update.value = null
+        _updateStatus.value = null
+        _updateProgress.value = 0
+        _downloadedApk.value = null
     }
 
     fun cancelDownload() {

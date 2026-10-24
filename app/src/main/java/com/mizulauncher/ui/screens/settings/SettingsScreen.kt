@@ -57,6 +57,9 @@ fun SettingsScreen(
     onRuntimeManifestChange: (String) -> Unit,
     onAccountChange: (String) -> Unit,
     onOpenControlEditor: () -> Unit,
+    updateChecking: Boolean,
+    updateStatus: String?,
+    onCheckUpdate: () -> Unit,
     onOpenAccount: () -> Unit,
     onOpenRuntime: () -> Unit,
     onOpenLogs: () -> Unit,
@@ -243,6 +246,16 @@ fun SettingsScreen(
             GlassCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(vertical = 8.dp)) {
                     SectionHeader("其他", Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+                    SettingRow(
+                        title = "检查更新",
+                        subtitle = updateStatus ?: "从 GitHub Release 获取最新版本",
+                        icon = MizuIcons.Refresh,
+                        trailing = {
+                            androidx.compose.material3.TextButton(onClick = onCheckUpdate) {
+                                Text(if (updateChecking) "检查中…" else "检查")
+                            }
+                        }
+                    )
                     SettingRow(
                         title = "账户",
                         subtitle = "微软正版登录 / 离线模式切换",

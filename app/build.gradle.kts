@@ -42,25 +42,21 @@ android {
     productFlavors {
         create("arm32") {
             dimension = "abi"
-            versionNameSuffix = "-arm32"
             ndk { abiFilters += "armeabi-v7a" }
             buildConfigField("String", "FLAVOR_ABI", "\"armeabi-v7a\"")
         }
         create("arm64") {
             dimension = "abi"
-            versionNameSuffix = "-arm64"
             ndk { abiFilters += "arm64-v8a" }
             buildConfigField("String", "FLAVOR_ABI", "\"arm64-v8a\"")
         }
         create("x86") {
             dimension = "abi"
-            versionNameSuffix = "-x86"
             ndk { abiFilters += "x86" }
             buildConfigField("String", "FLAVOR_ABI", "\"x86\"")
         }
         create("x64") {
             dimension = "abi"
-            versionNameSuffix = "-x64"
             ndk { abiFilters += "x86_64" }
             buildConfigField("String", "FLAVOR_ABI", "\"x86_64\"")
         }
@@ -131,6 +127,7 @@ dependencies {
     implementation(project(":core:launcher-bridge"))
     implementation(project(":core:runtime"))
     implementation(project(":core:auth"))
+    implementation(project(":core:update"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

@@ -32,6 +32,7 @@ import com.mizulauncher.ui.MainScaffold
 import com.mizulauncher.ui.SplashContent
 import com.mizulauncher.ui.components.GlassCard
 import com.mizulauncher.ui.components.ProgressBlock
+import com.mizulauncher.ui.components.UpdateDialog
 import com.mizulauncher.ui.screens.about.AboutScreen
 import com.mizulauncher.ui.screens.account.AccountScreen
 import com.mizulauncher.ui.screens.control.ControlEditorCanvas
@@ -111,11 +112,18 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
     val installing by vm.installing.collectAsStateWithLifecycle()
     val stage by vm.stage.collectAsStateWithLifecycle()
     val error by vm.error.collectAsStateWithLifecycle()
+    val updateInfo by vm.update.collectAsStateWithLifecycle()
+    val updateChecking by vm.updateChecking.collectAsStateWithLifecycle()
+    val updateProgress by vm.updateProgress.collectAsStateWithLifecycle()
+    val updateStatus by vm.updateStatus.collectAsStateWithLifecycle()
+    val downloadedApk by vm.downloadedApk.collectAsStateWithLifecycle()
     val runtimeStates by vm.runtimeStates.collectAsStateWithLifecycle()
     val profile by vm.profile.collectAsStateWithLifecycle()
 
     // 启动时静默续期一次：令牌快过期就刷新，失败不打扰用户
     LaunchedEffect(Unit) { vm.refreshAccountIfNeeded() }
+    // 启动时静默查一次更新；有新版才弹窗，没网/查失败不打扰
+    LaunchedEffect(Unit) { vm.checkForUpdate(manual = false) }
     val deviceCode by vm.deviceCode.collectAsStateWithLifecycle()
     val authBusy by vm.authBusy.collectAsStateWithLifecycle()
     val authStatus by vm.authStatus.collectAsStateWithLifecycle()
@@ -277,6 +285,9 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     onOpenControlEditor = { showControlEditor = true },
                     onOpenAccount = { destination = MainDestination.ACCOUNT },
                     onOpenRuntime = { destination = MainDestination.RUNTIME },
+                    updateChecking = updateChecking,
+                    updateStatus = updateStatus,
+                    onCheckUpdate = { vm.checkForUpdate(manual = true) },
                     onOpenLogs = { destination = MainDestination.LOGS },
                     onOpenAbout = { destination = MainDestination.ABOUT },
                     modifier = modifier
@@ -305,6 +316,23 @@ private fun AppContent(onThemeChange: (Boolean?) -> Unit) {
                     modifier = modifier
                 )
             }
+        }
+
+        // 更新提示：三种状态共用一个弹窗
+        updateInfo?.let { info ->
+            UpdateDialog(
+                info = info,
+                downloading = updateStatus == "正在下载…",
+                progress = updateProgress,
+                readyToInstall = downloadedApk != null,
+                status = updateStatus,
+                onDownload = { vm.downloadUpdate() },
+                onCancelDownload = { vm.cancelUpdateDownload() },
+                onInstall = {
+                    downloadedApk?.let { installApk(context, it) }
+                },
+                onDismiss = { vm.dismissUpdate() }
+            )
         }
 
         // 失败/提示：把真实原因摊开给用户，而不是静默失败
@@ -402,5 +430,34 @@ private fun ControlEditorFullscreen(
                 .align(Alignment.TopEnd)
                 .padding(16.dp)
         ) { Text("完成") }
+    }
+}
+
+/**
+ * 拉起系统安装器。
+ *
+ * 走 FileProvider 给 content:// —— Android 7.0 起直接传 file:// 会抛
+ * FileUriExposedException。Android 8.0+ 还需要用户先允许「安装未知应用」，
+ * 系统会自己弹授权页，这里不用额外处理。
+ */
+private fun installApk(context: android.content.Context, apk: java.io.File) {
+    runCatching {
+        val uri = androidx.core.content.FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.fileprovider",
+            apk
+        )
+        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }.onFailure {
+        android.widget.Toast.makeText(
+            context,
+            "无法启动安装器：${it.message}",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
     }
 }
