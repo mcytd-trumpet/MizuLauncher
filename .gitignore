@@ -33,5 +33,6 @@ Thumbs.db
 .key_password.txt
 .curseforge_api.txt
 
-# 本地推送辅助脚本（不走 git 通道时用）
-scripts/push_via_api.py
+
+# 调试 API 对接文档（作者自用，不入库）
+docs/DEBUG_API.md

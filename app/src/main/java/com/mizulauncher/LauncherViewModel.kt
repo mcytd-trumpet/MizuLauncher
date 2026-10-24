@@ -3,6 +3,7 @@ package com.mizulauncher
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.mizulauncher.debug.DebugApiHost
 import com.mizulauncher.auth.DeviceCode
 import com.mizulauncher.auth.MicrosoftAuth
 import com.mizulauncher.auth.MinecraftProfile
@@ -193,6 +194,9 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
     init {
         refreshInstances()
         runtimeManager.refresh()
+        // 让调试 API 拿到同一个 ViewModel 实例：UI 和 API 走同一条控制链路，
+        // 否则会出现「两边都能触发安装、互相打架」的情况。
+        DebugApiHost.attach(this)
     }
 
     // ---------------- 内置组件补全（首启 / 更新后） ----------------
@@ -342,6 +346,50 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
                     if (result is LaunchResult.Failed) _error.value = result.reason
                 }
                 .onFailure { _error.value = it.message ?: "准备启动文件失败" }
+        }
+    }
+
+    /**
+     * 只准备文件，不启动游戏。
+     *
+     * 用途：调试 API 的 `POST /instances/{id}/prepare`，以及以后做「预下载」按钮。
+     * 和 [launch] 共享同一套前置检查（依赖补全、Java 运行时），保证两条路径行为一致——
+     * 否则会出现「UI 点启动不让过、API 却能过」这种自相矛盾。
+     */
+    fun prepareOnly(meta: InstanceMeta) {
+        if (_installing.value) return
+        if (!bundleInstaller.scanned.value) {
+            _bundleNotice.value = "正在检查运行依赖，请稍候…"
+            return
+        }
+        if (bundleInstaller.pending.value.isNotEmpty()) {
+            _setupDismissed.value = false
+            _bundleNotice.value = "请先补全运行依赖，再准备游戏文件"
+            return
+        }
+        viewModelScope.launch {
+            _installing.value = true
+
+            _stage.value = "检查 Java 运行时"
+            val major = if (meta.javaMajor > 0) meta.javaMajor else runtimeManager.requiredMajorFor(meta.versionId)
+            val runtime = runtimeManager.ensure(major)
+            if (runtime.isFailure) {
+                _installing.value = false
+                _error.value = runtime.exceptionOrNull()?.message ?: "Java $major 不可用"
+                return@launch
+            }
+
+            _stage.value = "检查游戏文件"
+            val prepared = orchestrator.prepare(meta) { s -> _stage.value = s }
+            _installing.value = false
+
+            prepared
+                .onSuccess {
+                    refreshInstances()
+                    _stage.value = "准备完成"
+                    _installDone.value = true
+                }
+                .onFailure { _error.value = it.message ?: "准备文件失败" }
         }
     }
 

@@ -82,6 +82,17 @@ class DownloadEngine(
     private val _progress = MutableStateFlow(DownloadProgress())
     val progress: StateFlow<DownloadProgress> = _progress.asStateFlow()
 
+    /**
+     * 分片下载的共享线程池。
+     *
+     * 注意这里**故意**是小池子：文件级并发已经由 `maxParallelFiles` 控制，
+     * 再让每个文件各自 fork 4 个线程，峰值线程数会变成 24+，在低端机上
+     * 既抢不到带宽也容易被 LMK 干掉。这里按 CPU 核数给一个温和的上限。
+     */
+    private val chunkPool = java.util.concurrent.Executors.newFixedThreadPool(
+        (Runtime.getRuntime().availableProcessors() * 2).coerceIn(4, 8)
+    ) { r -> Thread(r, "mizu-chunk").apply { isDaemon = true } }
+
     private val meter = SpeedMeter()
     private val cancelFlag = java.util.concurrent.atomic.AtomicBoolean(false)
     private val mirrorFailures = AtomicInteger(0)
@@ -193,7 +204,10 @@ class DownloadEngine(
 
         var lastError: Exception? = null
         repeat(3) {
-            if (cancelFlag.get()) return TaskOutcome.SKIPPED
+            if (cancelFlag.get()) {
+                // 取消不是失败：临时文件留着续传
+                return TaskOutcome.SKIPPED
+            }
             try {
                 val url = resolveUrl(task)
                 downloadFile(url, task)
@@ -201,16 +215,20 @@ class DownloadEngine(
                     task.target.delete()
                     throw DownloadException("SHA1 校验失败：${task.target.name}")
                 }
+                // 成功一次就把该镜像的连败计数回退，避免一次抖动永久拖累后续任务
+                mirrorFailures.updateAndGet { v -> if (v > 0) v - 1 else 0 }
                 return TaskOutcome.DOWNLOADED
             } catch (e: Exception) {
                 lastError = e
-                if (e is DownloadException && e.message?.contains("404") == true) {
-                    mirrorFailures.incrementAndGet()
-                } else {
-                    mirrorFailures.incrementAndGet()
-                }
+                // 之前这里 if/else 两个分支做的事完全一样（都 +1），
+                // 404 和超时被同等对待、也从未回落，属于写了等于没写。
+                mirrorFailures.incrementAndGet()
             }
+            // 下一轮 loop 会重新 resolveUrl，计数到 3 时自动切官方源
         }
+
+        // 确定失败才清临时文件；中途取消的话上面已经 return 了
+        cleanupParts(task.target)
         task.target.delete()
         if (lastError is DownloadException) {
             android.util.Log.w("PCLDownload", "跳过 ${task.url}: ${lastError.message}")
@@ -235,7 +253,13 @@ class DownloadEngine(
         if (maxChunksPerFile > 1 && task.size >= chunkThreshold) {
             runCatching { downloadChunked(url, task) }
                 .onSuccess { return }
-                .onFailure { task.target.delete() }
+                .onFailure {
+                    // 取消时把已下好的分片留着，下次续传还能用；
+                    // 真失败则清干净再走单连接，否则分片会和 .part 混在一起算坏账。
+                    if (cancelFlag.get()) throw DownloadException("已取消")
+                    android.util.Log.w("PCLDownload", "分片模式失败，回退单连接：${it.message}")
+                    cleanupParts(task.target)
+                }
         }
         downloadSingle(url, task)
     }
@@ -280,16 +304,26 @@ class DownloadEngine(
             File(task.target.absolutePath + ".part$i") to (start to end)
         }
 
-        // 并行拉取（阻塞式，由外层 IO 线程池承载）
-        parts.map { (file, range) ->
-            Thread {
+        // 并行拉取。用共享的 chunkPool 限流——之前是每个任务自己开满 4 个线程，
+        // 6 个文件并发就是 24 个线程同时抢带宽，移动端很容易被系统直接杀掉。
+        val errors = java.util.Collections.synchronizedList(mutableListOf<Exception>())
+        chunkPool.invokeAll(parts.map { (file, range) ->
+            java.util.concurrent.Callable {
                 try {
                     fetchRange(url, file, range.first, range.second)
                 } catch (e: Exception) {
+                    // 记住第一个真实错误。之前只打一行日志就吞了，最终报的是
+                    // "分片不完整"，把「404 / 超时 / 不支持 Range」这些真正的线索全丢了。
+                    if (errors.isEmpty()) errors.add(e)
                     android.util.Log.w("PCLDownload", "分片失败 ${file.name}: ${e.message}")
                 }
-            }.apply { start() }
-        }.forEach { it.join() }
+            }
+        })
+
+        if (errors.isNotEmpty()) {
+            // 分片文件保留：下次续传时 start > 0 的位置可以直接复用
+            throw errors.first()
+        }
 
         // 校验所有分片齐全后合并
         val expected = parts.sumOf { (f, r) -> r.second - r.first + 1 }
@@ -305,18 +339,43 @@ class DownloadEngine(
         }
     }
 
+    /**
+     * 清掉某个目标文件的全部临时分片。
+     * 取消时**不能**删——留着才能续传；只有确定失败或任务被放弃时才清。
+     */
+    private fun cleanupParts(target: File) {
+        File(target.absolutePath + ".part").delete()
+        for (i in 0 until maxChunksPerFile) {
+            File(target.absolutePath + ".part$i").delete()
+        }
+    }
+
     private fun fetchRange(url: String, file: File, start: Long, end: Long) {
-        val request = okhttp3.Request.Builder().url(url).header("Range", "bytes=$start-$end").build()
+        val want = end - start + 1
+        var have = if (file.exists()) file.length() else 0L
+        if (have > want) {
+            file.delete()
+            have = 0L
+        }
+        if (have == want) return // 这个分片上次已经下完了
+
+        val request = okhttp3.Request.Builder()
+            .url(url)
+            .header("Range", "bytes=${start + have}-$end")
+            .build()
         client.newCall(request).execute().use { resp ->
             if (resp.code != 206) throw DownloadException("服务器不支持 Range（${resp.code}）")
-            file.outputStream().use { os ->
+            file.outputStream().close() // 确保文件存在，下面按需追加
+            val os = if (have > 0) java.io.FileOutputStream(file, true) else java.io.FileOutputStream(file, false)
+            os.use { out ->
                 resp.body?.byteStream()?.use { ins ->
                     val buf = ByteArray(64 * 1024)
                     while (true) {
                         if (cancelFlag.get()) throw DownloadException("已取消")
                         val n = ins.read(buf)
                         if (n < 0) break
-                        os.write(buf, 0, n)
+                        out.write(buf, 0, n)
+                        out.flush()
                         networkCounter.addAndGet(n.toLong())
                         meter.add(n.toLong())
                     }

@@ -73,10 +73,23 @@ class InstanceManager(private val rootDir: File) {
         gson.fromJson(File(dir, META_FILE).readText(), InstanceMeta::class.java)
     }.getOrNull()
 
+    /**
+     * 创建实例。**已存在则原样返回磁盘上的元数据，不覆盖。**
+     *
+     * 之前这里无条件 `writeText`，而 [LaunchOrchestrator.prepare] 每次启动都会先调 create()，
+     * 于是内存里的旧副本（例如主页列表里那份）会把磁盘上更新过的 lastPlayed、javaMajor、
+     * 重命名后的 name 全部冲回去。用户看到的现象就是「改了名字重启又变回来」「Java 版本
+     * 每次启动都要重新探测一遍」。true 的语义应该是「确保存在」，不是「重新写入」。
+     */
     fun create(meta: InstanceMeta): InstanceMeta {
         val dir = File(instancesDir, meta.id)
         dir.mkdirs()
-        File(dir, META_FILE).writeText(gson.toJson(meta))
+        val file = File(dir, META_FILE)
+        if (file.isFile) {
+            ensureSkeleton(meta)
+            return read(dir) ?: meta
+        }
+        file.writeText(gson.toJson(meta))
         ensureSkeleton(meta)
         return meta
     }

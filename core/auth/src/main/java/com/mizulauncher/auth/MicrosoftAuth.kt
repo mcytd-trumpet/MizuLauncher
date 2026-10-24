@@ -285,7 +285,12 @@ class MicrosoftAuth(
     private fun postForm(url: String, body: FormBody): JsonObject {
         val req = Request.Builder().url(url).post(body).build()
         val (code, text) = executeRaw(req)
-        if (code != 200) throw AuthException("请求 $url 失败（HTTP $code）：${text.take(200)}")
+        if (code != 200) {
+            // 5xx、408、429 是服务端/链路问题，过一会儿再试就行；
+            // 400 invalid_grant 才是 refresh_token 真的作废了。
+            val transient = code >= 500 || code == 408 || code == 429
+            throw AuthException("请求 $url 失败（HTTP $code）：${text.take(200)}", retryable = transient)
+        }
         return JsonParser.parseString(text).asJsonObject
     }
 
@@ -368,7 +373,17 @@ data class MinecraftProfile(
         get() = expiresAtEpochMs > 0 && System.currentTimeMillis() > expiresAtEpochMs - 60_000
 }
 
-class AuthException(message: String) : Exception(message)
+/**
+ * 认证链路的统一异常。
+ *
+ * [retryable] 区分「这个凭据已经没用了」和「这次只是没连上」——两者在处理上完全不同：
+ * 前者必须清空本地档案让用户重新登录，后者要保留档案等下次再试。
+ * 之前不区分，断网一次就把账号删了。
+ */
+class AuthException(
+    message: String,
+    val retryable: Boolean = false
+) : Exception(message)
 
 // ------------------------------------------------------------------ Gson 小工具
 

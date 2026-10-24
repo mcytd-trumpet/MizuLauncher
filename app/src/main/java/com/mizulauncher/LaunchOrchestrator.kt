@@ -89,24 +89,34 @@ class LaunchOrchestrator(context: Context) {
             val manifest = repository.loadManifest().getOrThrow()
 
             val im = container.instanceManager
-            im.create(meta)
-            im.ensureSkeleton(meta)
-            val gameDir = im.gameDirOf(meta)
+            // 以磁盘上的元数据为准。传进来的 meta 可能来自主页那份缓存列表，
+            // 里面缺了别处刚写进去的字段（javaMajor / lastPlayed / 重命名后的 name）。
+            val stored = im.create(meta)
+            var current = stored.copy(
+                // 传进来的这几个决定「装什么」，必须是调用方的意图
+                versionId = meta.versionId,
+                loaderType = meta.loaderType,
+                loaderVersion = meta.loaderVersion,
+                name = meta.name.ifBlank { stored.name },
+                javaMajor = if (meta.javaMajor > 0) meta.javaMajor else stored.javaMajor
+            )
+            im.ensureSkeleton(current)
+            val gameDir = im.gameDirOf(current)
             val versionsDir = File(gameDir, "versions")
 
             // 先把加载器装好（它会在 versions/ 下写出带 inheritsFrom 的 profile），
             // 否则后面按 versionId 查清单会找不到（例如 1.20.1-fabric-0.15.11）。
-            if (meta.loaderType != "vanilla" && meta.loaderType.isNotBlank()) {
-                val profileJson = File(versionsDir, "${meta.versionId}/${meta.versionId}.json")
+            if (current.loaderType != "vanilla" && current.loaderType.isNotBlank()) {
+                val profileJson = File(versionsDir, "${current.versionId}/${current.versionId}.json")
                 if (!profileJson.isFile) {
-                    stage("安装 ${meta.loaderType} 加载器")
+                    stage("安装 ${current.loaderType} 加载器")
                     when (val r = loaderInstaller.install(
-                        gameVersion = meta.versionId.substringBefore('-', meta.versionId)
-                            .let { if (it.count { c -> c == '.' } >= 1) it else meta.versionId },
-                        loaderType = meta.loaderType,
-                        loaderVersion = meta.loaderVersion,
+                        gameVersion = current.versionId.substringBefore('-', current.versionId)
+                            .let { if (it.count { c -> c == '.' } >= 1) it else current.versionId },
+                        loaderType = current.loaderType,
+                        loaderVersion = current.loaderVersion,
                         versionsDir = versionsDir,
-                        librariesDir = im.sharedLibsDir(meta),
+                        librariesDir = im.sharedLibsDir(current),
                         onStage = { stage(it) }
                     )) {
                         is com.mizulauncher.minecraft.LoaderInstaller.Outcome.Success -> Unit
@@ -119,29 +129,32 @@ class LaunchOrchestrator(context: Context) {
             }
 
             // 加载器 profile 是自己写的文件，清单里没有它，需要单独构造 entry
-            val localProfile = File(versionsDir, "${meta.versionId}/${meta.versionId}.json")
-            val inManifest = manifest.versions.firstOrNull { it.id == meta.versionId }
+            val localProfile = File(versionsDir, "${current.versionId}/${current.versionId}.json")
+            val inManifest = manifest.versions.firstOrNull { it.id == current.versionId }
             val entry = if (inManifest != null) {
                 inManifest
             } else if (localProfile.isFile) {
-                VersionEntry(meta.versionId, "release", localProfile.toURI().toString())
+                VersionEntry(current.versionId, "release", localProfile.toURI().toString())
             } else {
-                return@withContext fail("版本清单中找不到 ${meta.versionId}，且本地无版本配置")
+                return@withContext fail("版本清单中找不到 ${current.versionId}，且本地无版本配置")
             }
 
             stage("解析版本 JSON（含加载器继承）")
             val merged = if (localProfile.isFile) {
-                resolveLocalProfileSupport(meta, entry, localProfile)
+                resolveLocalProfileSupport(current, entry, localProfile)
             } else {
                 repository.resolveWithInheritance(entry).getOrThrow()
             }
             // 解析出的版本可能带加载器信息，回填到实例元数据
             val actualJava = com.mizulauncher.minecraft.VersionRules.requiredJavaMajor(merged)
-            if (actualJava != meta.javaMajor) {
-                container.instanceManager.update(meta.copy(javaMajor = actualJava))
+            if (actualJava > 0 && actualJava != current.javaMajor) {
+                // 必须写回 current，否则后面那次 update(lastPlayed) 会用旧值时把这里覆盖掉，
+                // 表现为每次启动都重新探测一遍 Java 版本。
+                current = current.copy(javaMajor = actualJava)
+                container.instanceManager.update(current)
             }
 
-            val versionDir = File(versionsDir, meta.versionId).apply { mkdirs() }
+            val versionDir = File(versionsDir, current.versionId).apply { mkdirs() }
 
             stage("下载资源索引")
             val assetIndex = merged.assetIndex?.let { ref ->
@@ -160,13 +173,13 @@ class LaunchOrchestrator(context: Context) {
 
             val layout = DownloadPlanBuilder.ClientLayout(
                 gameDir = gameDir.absolutePath,
-                assetsDir = im.sharedAssetsDir(meta).absolutePath,
-                librariesDir = im.sharedLibsDir(meta).absolutePath,
+                assetsDir = im.sharedAssetsDir(current).absolutePath,
+                librariesDir = im.sharedLibsDir(current).absolutePath,
                 versionsDir = versionsDir.absolutePath
             )
 
             val clientUrl = merged.downloads["client"]?.url
-            val plan = DownloadPlanBuilder.build(meta.versionId, merged, layout, assetIndex, clientUrl)
+            val plan = DownloadPlanBuilder.build(current.versionId, merged, layout, assetIndex, clientUrl)
 
             stage("准备文件（${plan.size} 项）")
             val tasks = ArrayList<DownloadTask>(plan.size + 2)
@@ -174,7 +187,7 @@ class LaunchOrchestrator(context: Context) {
             // 版本 JSON：Forge/Fabric 等启动器会回读，必须写
             tasks += DownloadTask(
                 url = entry.url,
-                target = File(versionDir, "${meta.versionId}.json"),
+                target = File(versionDir, "${current.versionId}.json"),
                 sha1 = entry.sha1,
                 downloadClass = com.mizulauncher.download.DownloadClass.METADATA,
                 fatal = true
@@ -188,16 +201,16 @@ class LaunchOrchestrator(context: Context) {
             val account = resolveAccount()
             pendingAccount = account
             val request = ArgumentBuilder.build(
-                versionId = meta.versionId,
+                versionId = current.versionId,
                 merged = merged,
                 layout = layout,
                 account = account,
-                instanceId = meta.id
+                instanceId = current.id
             )
             stage("准备完成")
 
             // 记录一次「最近活动」，列表按此排序
-            container.instanceManager.update(meta.copy(lastPlayed = System.currentTimeMillis()))
+            container.instanceManager.update(current.copy(lastPlayed = System.currentTimeMillis()))
             Result.success(request)
         } catch (e: Exception) {
             fail(e.message ?: e.javaClass.simpleName)

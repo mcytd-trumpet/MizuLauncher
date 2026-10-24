@@ -27,7 +27,11 @@ class AccountSession(
      * - 没登录 → null
      * - 未过期 → 原样返回
      * - 已过期但还有 refresh_token → 续期后返回（并写回）
-     * - 续期失败 → 清空并返回 null，让上层引导重新登录
+     * - 续期失败且**凭据确实作废** → 清空并返回 null，让上层引导重新登录
+     * - 续期失败但只是没网 → 保留档案，返回 null，本次按离线启动
+     *
+     * 最后一条是之前漏掉的：`runCatching { }.getOrElse { store.save(null) }` 不分原因，
+     * 用户在地铁里断一下网，回桌面就发现正版账号被踢下线、要重新念一遍设备码。
      */
     fun valid(): MinecraftProfile? {
         val saved = store.load() ?: return null
@@ -37,16 +41,27 @@ class AccountSession(
             store.save(null)
             return null
         }
-        return runCatching {
+        return try {
             val ms = auth.refresh(saved.refreshToken)
             val refreshed = auth.loginWithXbox(ms).copy(msClientId = saved.msClientId)
             store.save(refreshed)
             refreshed
-        }.getOrElse {
-            store.save(null)
+        } catch (e: Exception) {
+            if (isCredentialDead(e)) {
+                store.save(null)
+            }
+            // 网络类失败：档案留着，下次有网还能接着续
             null
         }
     }
+
+    /**
+     * 判断这次失败是不是「refresh_token 真的不能用了」。
+     *
+     * 只有明确的鉴权错误才算。超时、DNS 失败、连接被重置、5xx 都不算——
+     * 那些情况下凭据还是好的，删掉纯属误伤。
+     */
+    private fun isCredentialDead(e: Throwable): Boolean = isCredentialDeadError(e)
 
     fun save(profile: MinecraftProfile) = store.save(profile)
 
@@ -59,8 +74,7 @@ class AccountSession(
     }
 }
 
-/** 档案 → 内核 Account */
-fun MinecraftProfile.toAccount(): Account = Account(
+/** 档案 → 内核 Account */fun MinecraftProfile.toAccount(): Account = Account(
     username = name,
     uuid = uuid,
     accessToken = accessToken,
@@ -83,4 +97,22 @@ object ProfileCodec {
             .getOrNull()
             ?.takeIf { it.name.isNotBlank() && it.accessToken.isNotBlank() }
     }
+}
+
+/**
+ * 这次续期失败，是不是「refresh_token 真的作废了」？
+ *
+ * 判据只看 OAuth 的**错误码**，不看 HTTP 状态码：
+ *  - `invalid_grant`：refresh_token 过期/被撤销/被改密码顶掉 → 只能重新登录
+ *  - `invalid_client`：client_id 配置错了 → 重试也没用
+ *  - `interaction_required`：需要用户交互 → 同样得走登录流程
+ * 其余（超时、DNS、连接重置、5xx、429）都是暂时的，凭据应该保留。
+ */
+internal fun isCredentialDeadError(e: Throwable): Boolean {
+    val auth = e as? AuthException ?: return false
+    if (auth.retryable) return false
+    val msg = auth.message.orEmpty()
+    return msg.contains("invalid_grant", ignoreCase = true) ||
+        msg.contains("invalid_client", ignoreCase = true) ||
+        msg.contains("interaction_required", ignoreCase = true)
 }

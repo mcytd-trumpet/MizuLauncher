@@ -60,9 +60,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent { App() }
     }
-}
-
-@Composable
+}@Composable
 fun App() {
     var showSplash by remember { mutableStateOf(true) }
     var splashProgress by remember { mutableStateOf(0f) }

@@ -101,6 +101,11 @@ jobs:
       - name: 单元测试
         run: ./gradlew test --stacktrace
 
+      - name: 校验调试 API 文档与代码一致
+        # 调试文档最容易烂的方式是只改一边。这条会在「代码加了接口没写文档」
+        # 或「文档写了接口没实现」时直接失败。
+        run: python3 scripts/check_api_doc.py
+
       - name: 下载并打包内置 JRE（可选）
         # 只有配了 JRE_ARCHIVES_URL 才执行；没配就跳过，APK 里不含预装 Java，
         # 运行时会走远端清单按需下载。

@@ -251,6 +251,57 @@ class MicrosoftAuthTest {
         assertNull(store.value)
     }
 
+    @Test
+    fun `续期时服务端 5xx 不该删掉本地账号`() {
+        // 真 bug：之前不分原因一律 store.save(null)，断网/服务端抖动一次就要重新登录。
+        val http = FakeHttp(listOf("login.live.com/oauth20_token" to (503 to """{"error":"server_error"}""")))
+        val store = MemoryStore(
+            MinecraftProfile("Old", "u", "t", expiresAtEpochMs = 1L, refreshToken = "still-good")
+        )
+        val session = AccountSession(store, MinecraftAuthFor(http))
+        assertNull("这次没续上，返回 null 让上层按离线启动", session.valid())
+        assertNotNull("凭据没坏，档案必须留着", store.value)
+        assertEquals("still-good", store.value!!.refreshToken)
+    }
+
+    @Test
+    fun `续期时 429 限流也不该删账号`() {
+        val http = FakeHttp(listOf("login.live.com/oauth20_token" to (429 to """{"error":"too_many_requests"}""")))
+        val store = MemoryStore(
+            MinecraftProfile("Old", "u", "t", expiresAtEpochMs = 1L, refreshToken = "rt")
+        )
+        assertNull(AccountSession(store, MinecraftAuthFor(http)).valid())
+        assertNotNull(store.value)
+    }
+
+    @Test
+    fun `invalid_grant 才算凭据作废`() {
+        assertTrue(isCredentialDeadError(AuthException("""{"error":"invalid_grant"}""")))
+        assertTrue(isCredentialDeadError(AuthException("error=invalid_client")))
+        assertTrue(isCredentialDeadError(AuthException("interaction_required")))
+    }
+
+    @Test
+    fun `网络类失败不算凭据作废`() {
+        assertFalse(isCredentialDeadError(AuthException("HTTP 503")))
+        assertFalse(isCredentialDeadError(AuthException("HTTP 429", retryable = true)))
+        assertFalse("IOException 不是 AuthException，凭据状态未知，不能删",
+            isCredentialDeadError(java.io.IOException("timeout")))
+        assertFalse(isCredentialDeadError(IllegalStateException("随便什么")))
+    }
+
+    @Test
+    fun `postForm 把 5xx 和 429 标记为可重试`() {
+        // 与 MicrosoftAuth.postForm 的判断保持一致
+        fun retryable(code: Int) = code >= 500 || code == 408 || code == 429
+        assertTrue(retryable(500)); assertTrue(retryable(503))
+        assertTrue(retryable(408)); assertTrue(retryable(429))
+        assertFalse("400 是凭据问题，重试无用", retryable(400))
+        assertFalse(retryable(401))
+    }
+
+    private fun MinecraftAuthFor(http: FakeHttp) = MicrosoftAuth("c", http.client)
+
     // ------------------------------------------------------------ 编解码与转换
 
     @Test

@@ -137,4 +137,46 @@ class InstanceManagerTest {
         mgr.create(meta)
         assertEquals(tmp.root.resolve(".minecraft").path, mgr.gameDirOf(meta).path)
     }
+
+    @Test
+    fun `已经存在的实例再次 create 不会覆盖磁盘上的改动`() {
+        // 真 bug：prepare() 每次启动都会 create(meta)，而 meta 往往是主页那份旧缓存。
+        // 无条件写入会把改名、javaMajor、lastPlayed 全部冲回旧值。
+        val mgr = InstanceManager(tmp.root)
+        val meta = InstanceMeta(name = "原名", versionId = "1.20.1", javaMajor = 17)
+        mgr.create(meta)
+
+        mgr.update(meta.copy(name = "新名", javaMajor = 21, lastPlayed = 12345L))
+
+        // 拿着旧副本再 create 一次（模拟从主页列表点启动）
+        val returned = mgr.create(meta)
+
+        val stored = mgr.list().single()
+        assertEquals("改名不该被冲掉", "新名", stored.name)
+        assertEquals("javaMajor 不该被冲掉", 21, stored.javaMajor)
+        assertEquals(12345L, stored.lastPlayed)
+        assertEquals("create 应返回磁盘上的版本", "新名", returned.name)
+    }
+
+    @Test
+    fun `首次 create 会正常写入`() {
+        val mgr = InstanceManager(tmp.root)
+        val meta = InstanceMeta(name = "第一次", versionId = "1.20.1", javaMajor = 8)
+        val returned = mgr.create(meta)
+        assertEquals("第一次", returned.name)
+        assertEquals(8, returned.javaMajor)
+        assertEquals(1, mgr.list().size)
+    }
+
+    @Test
+    fun `create 仍然会补齐被删掉的目录骨架`() {
+        val mgr = InstanceManager(tmp.root)
+        val meta = InstanceMeta(versionId = "1.20.1")
+        mgr.create(meta)
+        val mods = mgr.gameDirOf(meta).resolve("mods")
+        assertTrue(mods.deleteRecursively())
+
+        mgr.create(meta)
+        assertTrue("已存在的实例也要能把目录补回来", mods.isDirectory)
+    }
 }

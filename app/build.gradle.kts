@@ -129,6 +129,7 @@ dependencies {
     implementation(project(":core:auth"))
     implementation(project(":core:update"))
     implementation(project(":core:setup"))
+    implementation(project(":core:debug-api"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
