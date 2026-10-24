@@ -191,12 +191,32 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
 
     val runtimeStates: StateFlow<Map<Int, RuntimeManager.State>> = runtimeManager.states
 
+    /**
+     * 初始化。
+     *
+     * **这里的每一行都在主线程跑**（ViewModel 由 Activity 构造），所以只做「够快」的事。
+     *
+     * 之前的写法是 `refreshInstances()` + `runtimeManager.refresh()` + `DebugApiHost.attach()`
+     * 三连同步调用，问题在于：
+     *  - `runtimeManager.refresh()` 对每个受支持的 Java 版本调 `sizeOf(dir)`，
+     *    那是 `walkTopDown()` 全树递归求和。内置 JRE 是上千个小文件、几十 MB，
+     *    5 个版本扫一遍能到秒级；
+     *  - 这段时间主线程卡着，首帧画不出来 → 白屏，久一点直接 ANR。
+     *
+     * 用户看到的现象就是「打开后白屏几秒，然后退出去」。
+     *
+     * 现在：实例列表和运行时扫描都丢到 IO 线程；调试 API 仍然同步起（它只做
+     * socket bind + SecureRandom，毫秒级），因为它是给外部脚本连的，
+     * 晚起一秒就意味着脚本可能先连上失败。
+     */
     init {
-        refreshInstances()
-        runtimeManager.refresh()
-        // 让调试 API 拿到同一个 ViewModel 实例：UI 和 API 走同一条控制链路，
-        // 否则会出现「两边都能触发安装、互相打架」的情况。
+        // 调试 API 优先起：它是外部依赖，越早可用越好，且开销极小
         DebugApiHost.attach(this)
+
+        viewModelScope.launch(Dispatchers.IO) {
+            refreshInstances()
+            runtimeManager.refresh()
+        }
     }
 
     // ---------------- 内置组件补全（首启 / 更新后） ----------------

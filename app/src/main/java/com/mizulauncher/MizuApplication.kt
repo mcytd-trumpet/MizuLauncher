@@ -115,8 +115,16 @@ class MizuApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        container = AppContainer(this)
+        // **先给 instance 赋值，再构造 container**。
+        //
+        // AppContainer 的字段初始化里会 new 出 AccountSession / InstanceManager 等对象。
+        // 它们目前不反过来读 `Context.container`，但这是个随时会被踩的坑：
+        // 只要哪天有人在某个构造器里顺手用了一下 `Context.container`，
+        // 就会在启动瞬间抛 UninitializedPropertyAccessException（lateinit 未初始化），
+        // 异常发生在 Application.onCreate 里 → 整个进程起不来 → 用户看到的是「打开就退」。
+        // 把顺序换过来，零成本消掉这个隐患。
         instance = this
+        container = AppContainer(this)
         // 注册 Pojav 内核桥接：未引入 submodule 时它自身会判定为不可用，不影响其余功能
         PojavBridgeProvider.factory = { ctx ->
             com.mizulauncher.bridge.PojavBridgeImpl(ctx)
