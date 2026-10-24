@@ -66,8 +66,9 @@ class RuntimeManager(
         fun is32Bit(abi: String): Boolean =
             abi == "armeabi-v7a" || abi == "x86" || abi == "arm" || abi == "arm32"
 
-        /** 当前设备的首选 ABI */
-        fun primaryAbi(): String = android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        /** 当前设备的首选 ABI（取不到时按 64 位 ARM 处理，这是绝大多数机型） */
+        fun primaryAbi(): String =
+            runCatching { android.os.Build.SUPPORTED_ABIS?.firstOrNull() }.getOrNull() ?: "arm64-v8a"
     }
 
     /** 单个运行时的状态 */
@@ -80,9 +81,6 @@ class RuntimeManager(
         data class Unavailable(val reason: String) : State
         data class Failed(val message: String) : State
     }
-
-    private val _states = MutableStateFlow<Map<Int, State>>(initStates())
-    val states: StateFlow<Map<Int, State>> = _states.asStateFlow()
 
     private val runtimesDir: File
         get() = File(context.filesDir, "runtime").apply { mkdirs() }
@@ -106,19 +104,38 @@ class RuntimeManager(
 
     // ---------------- 状态刷新 ----------------
 
+    /**
+     * 初始状态表。
+     *
+     * **这里必须传 `emptyMap()`，不能在初始化器里读 `_states`。**
+     *
+     * 原来写的是 `private val _states = MutableStateFlow(initStates())`，
+     * 而 `initStates()` 第一行是 `val previous = _states.value`——
+     * 属性正在初始化时又去读它自己，此刻 `_states` 还是 null，
+     * 直接抛 NullPointerException。异常在构造函数里抛出，ViewModel 反射创建失败，
+     * 整个 Activity 起不来：`Cannot create an instance of class LauncherViewModel`。
+     *
+     * 顺带一个教训：这个缺陷在旧代码里一直存在，但旧代码的 `initStates()` 只在
+     * 构造完成后由 `refresh()` 触发，所以没炸。把扫描挪到 IO 线程后，
+     * 构造期的那次初始化反而被凸显出来——**时序问题的修复经常会掀开底层旧账**。
+     */
+    private val _states = MutableStateFlow<Map<Int, State>>(scan(emptyMap()))
+    val states: StateFlow<Map<Int, State>> = _states.asStateFlow()
+
     /** 重新扫描磁盘，更新所有版次的就绪状态 */
     fun refresh() {
-        _states.value = initStates()
+        _states.value = scan(_states.value)
     }
 
     /**
-     * 扫描磁盘生成状态表。
+     * 扫描磁盘生成状态表。纯函数：只依赖入参 `previous` 和磁盘现状，
+     * 不读任何成员状态，所以构造期调用也安全。
+     *
      * 关键点：**已在下载/解压中的条目必须保留原状态**，否则用户点「安装」的瞬间
      * 一次 [refresh] 就会把 UI 上的进度条打回「未安装」。
      */
-    private fun initStates(): Map<Int, State> {
+    private fun scan(previous: Map<Int, State>): Map<Int, State> {
         val abi = primaryAbi()
-        val previous = _states.value
         val map = HashMap<Int, State>()
         for (major in SUPPORTED_MAJORS) {
             val prev = previous[major]
