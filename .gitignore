@@ -33,3 +33,6 @@ Thumbs.db
 .key_password.txt
 .curseforge_api.txt
 
+
+# 调试 API 对接文档（作者自用，不入库）
+docs/DEBUG_API.md

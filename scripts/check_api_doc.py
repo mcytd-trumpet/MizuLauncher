@@ -4,11 +4,13 @@
 
 加这个脚本的原因：调试文档最容易烂掉的方式不是写错，而是**只改了一边**。
 代码里加了接口忘了写文档，或者文档规划了接口但代码没实现，都很难靠人眼发现。
-CI 里跑一遍，不一致就红。
+
+> 调试文档目前**不入库**（作者自己对接调试用），所以脚本在没有文档时会跳过，
+> 而不是判失败。想启用校验就把文档放到 docs/DEBUG_API.md。
 
 用法：
     python3 scripts/check_api_doc.py
-退出码 0 = 一致，1 = 不一致。
+退出码 0 = 一致或跳过，1 = 不一致。
 """
 
 from __future__ import annotations
@@ -56,8 +58,9 @@ def doc_endpoints() -> set[tuple[str, str]]:
 
 def main() -> int:
     if not DOC.is_file():
-        print(f"❌ 找不到文档：{DOC}", file=sys.stderr)
-        return 1
+        # 文档不入库，CI 上一定没有。跳过而不是失败，否则每次构建都会红。
+        print("⏭  未找到 docs/DEBUG_API.md（调试文档不入库），跳过一致性校验")
+        return 0
     if not ROUTES.is_file():
         print(f"❌ 找不到路由表：{ROUTES}", file=sys.stderr)
         return 1

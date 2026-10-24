@@ -304,7 +304,7 @@ if (cfg != null) {
 - 每次 push / PR 跑全量单测 + 五个 ABI 变体编译，产物上传为 artifact；
 - 打 `v*` tag 时自动建 Release，挂上五个 APK 与 `SHA256SUMS.txt`；
 - **JRE 资源默认缺席**：仓库变量 `JRE_ARCHIVES_URL` 没配就跳过内置步骤，**构建依然成功**，只是 APK 里没预装 Java（运行时会走远端清单）。这条是硬要求——不能让「没配 Secret」变成「打不出包」。
-- **调试 API 文档一致性校验**：`python3 scripts/check_api_doc.py` 会比对 `docs/DEBUG_API.md` 与 `ApiRoutes.kt` 的接口清单，只改一边就红。调试文档最容易烂的方式不是写错，而是漏更新。
+- **调试 API 文档一致性校验**：`python3 scripts/check_api_doc.py` 会比对 `docs/DEBUG_API.md` 与 `ApiRoutes.kt` 的接口清单，只改一边就红。该文档**不入库**，脚本检测不到时会自动跳过，不影响构建。
 
 ---
 
@@ -312,12 +312,13 @@ if (cfg != null) {
 
 App 内置一个**只监听 `127.0.0.1`** 的 HTTP 接口，用来从 shell / 脚本驱动启动器：列实例、准备文件、启动游戏、查进度、切换下载源、设备码登录、看日志。
 
-- 完整文档：[`docs/DEBUG_API.md`](docs/DEBUG_API.md)（27 个接口，含 curl 示例、错误码表、调试场景脚本）
-- `debug` 构建默认开启；`release` 包需要开关文件 `files/mizu-debug-api.on`
-- 连接信息（端口 + 一次性 token）写在 `files/mizu-debug-api.json`，**不打 logcat**
-- 端口每次启动随机，token 进程退出即失效
+- **无条件默认开启**，没有开关文件，debug / release 行为一致
+- 连接必须带 token：每次进程启动用 `SecureRandom` 重新生成 128 位，进程退出即失效
+- 连接信息（端口 + token）写在 `files/mizu-debug-api.json`，**不打 logcat**
+- 端口每次启动随机分配，别写死
+- 可选 **AES-256-GCM 全链路加密**：密钥由 token 派生，报文带 `X-Mizu-Encrypted: 1`；明文 `curl` 仍然可用
 
-三条安全边界是有意为之，别改成 `0.0.0.0`：接口能删你的存档、能读到账号续期令牌，开给局域网等于把家门钥匙挂在门口。
+三层安全边界是有意为之，别改成 `0.0.0.0`：接口能删你的存档、能读到账号续期令牌，开给局域网等于把家门钥匙挂在门口。
 
 ```bash
 INFO=$(su -c 'cat /data/data/com.mizulauncher/files/mizu-debug-api.json')
@@ -325,6 +326,8 @@ PORT=$(echo "$INFO" | grep -o '"port":[0-9]*' | grep -o '[0-9]*')
 TOKEN=$(echo "$INFO" | grep -o '"token":"[a-f0-9]*"' | cut -d'"' -f4)
 curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/diagnostics"
 ```
+
+接口清单可随时从 `GET /api/v1/routes` 取，权威来源是 `core/debug-api/.../ApiRoutes.kt` 的 `ENDPOINTS`。
 
 ---
 
