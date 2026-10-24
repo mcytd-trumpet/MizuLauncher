@@ -73,8 +73,18 @@ def main() -> int:
 
     head_sha = git("rev-parse", args.head)
     message = git("log", "-1", "--pretty=%B", args.head)
-    changed = git("diff", "--name-status", args.base, args.head).splitlines()
-    if not changed:
+
+    # --base 只用来「取远端基线 tree」，不要求本地存在那个提交对象。
+    # 本地仓库是新建的（没有远端历史）时，git diff <base> 会直接 fatal，
+    # 但字节级比对本来就只需要「本地全部文件 vs 远端 tree」，diff 只是加速手段。
+    try:
+        changed = git("diff", "--name-status", args.base, args.head).splitlines()
+        have_base = True
+    except subprocess.CalledProcessError:
+        print(f"本地没有 {args.base[:8]} 对象（新克隆的仓库），改为全量比对")
+        changed = []
+        have_base = False
+    if not changed and have_base:
         # 没有内容变更不代表没有要修的东西（比如文件模式），下面继续走一遍。
         print("内容无变更，继续检查文件模式")
 
@@ -86,6 +96,17 @@ def main() -> int:
     # 1) 拿基线 tree
     base_commit = call(token, "GET", f"/repos/{args.repo}/git/commits/{args.base}")
     base_tree = base_commit["tree"]["sha"]
+
+    if not have_base:
+        # 没有 diff 可用：拿本地 HEAD 的完整文件清单当候选集，
+        # 远端有而本地没有的（且不被 gitignore）另行按 tree 差集删除。
+        changed = [
+            f"A\t{p}" for p in git("ls-tree", "-r", "--name-only", args.head).splitlines()
+        ]
+        local_set = set(git("ls-tree", "-r", "--name-only", args.head).splitlines())
+        for p in remote_files:
+            if p not in local_set:
+                changed.append(f"D\t{p}")
 
     # 2) 逐个文件生成 blob，记录 路径 -> blob sha 或 None（删除）
     updates: dict[str, str | None] = {}
