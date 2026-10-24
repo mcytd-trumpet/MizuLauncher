@@ -64,6 +64,16 @@ class BundleInstaller(private val context: Context) {
     private val _phase = MutableStateFlow<Phase>(Phase.Idle)
     val phase: StateFlow<Phase> = _phase.asStateFlow()
 
+    /**
+     * 是否至少完成过一次扫描。
+     *
+     * 没有这个标志会有一个真实的时间窗：启动时第一次 [scan] 要落盘并核对几十兆的 zip，
+     * 期间 [pending] 还是空列表，用户若此刻点「开始游戏」就会绕过依赖检查，
+     * 最后得到一句 `Cannot run program "java"`。
+     */
+    private val _scanned = MutableStateFlow(false)
+    val scanned: StateFlow<Boolean> = _scanned.asStateFlow()
+
     private val _version = MutableStateFlow(0)
 
     /** 每次扫描/安装后 +1，UI 用它判断是否要重新渲染 */
@@ -108,6 +118,7 @@ class BundleInstaller(private val context: Context) {
         )
         _items.value = all
         _pending.value = pending
+        _scanned.value = true
         _version.value = _version.value + 1
         Log.i(TAG, "扫描内置组件：共 ${all.size} 项，待安装 ${pending.size} 项")
         return pending

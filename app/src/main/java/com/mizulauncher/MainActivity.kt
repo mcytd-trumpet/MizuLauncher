@@ -33,6 +33,7 @@ import com.mizulauncher.ui.MainScaffold
 import com.mizulauncher.ui.SplashContent
 import com.mizulauncher.ui.components.DownloadTaskCard
 import com.mizulauncher.ui.components.GlassCard
+import com.mizulauncher.ui.components.InstanceActionSheet
 import com.mizulauncher.ui.components.formatEta
 import com.mizulauncher.ui.components.ProgressBlock
 import com.mizulauncher.ui.components.SetupDialog
@@ -151,6 +152,7 @@ private fun AppContent(darkMode: Boolean?, onThemeChange: (Boolean?) -> Unit) {
     val bundlePhase by vm.bundlePhase.collectAsStateWithLifecycle()
     val setupDismissed by vm.setupDismissed.collectAsStateWithLifecycle()
     val bundleNotice by vm.bundleNotice.collectAsStateWithLifecycle()
+    val instanceSizes by vm.instanceSizes.collectAsStateWithLifecycle()
     val runtimeStates by vm.runtimeStates.collectAsStateWithLifecycle()
     val profile by vm.profile.collectAsStateWithLifecycle()
 
@@ -180,8 +182,22 @@ private fun AppContent(darkMode: Boolean?, onThemeChange: (Boolean?) -> Unit) {
     val authError by vm.authError.collectAsStateWithLifecycle()
 
     var destination by remember { mutableStateOf(MainDestination.HOME) }
+    /** 长按实例卡片时打开操作面板的目标；null 表示面板关闭 */
+    var actionTarget by remember { mutableStateOf<com.mizulauncher.instance.InstanceMeta?>(null) }
     var currentSource by remember { mutableStateOf(settings.downloadSource) }
+    /**
+     * 离线显示名。
+     *
+     * 正版登录时 `settings.lastAccount` 会被写成正版名，但这里是 `remember` 的本地态，
+     * 不会自动跟着变 —— 结果就是「退出正版后，账户页显示的是上次正版的名字」。
+     * 跟着 `profile` 的变化同步一次即可。
+     */
     var accountName by remember { mutableStateOf(settings.lastAccount) }
+    LaunchedEffect(profile?.name) {
+        val live = profile?.name
+        if (live != null && live != accountName) accountName = live
+        else if (live == null && accountName != settings.lastAccount) accountName = settings.lastAccount
+    }
     var backgroundVersion by remember { mutableStateOf(0) }
 
     // 安装完成 → 自动回主页并选中新实例（避免用户以为「没反应」）
@@ -262,7 +278,8 @@ private fun AppContent(darkMode: Boolean?, onThemeChange: (Boolean?) -> Unit) {
                     onOpenSettings = { destination = MainDestination.SETTINGS },
                     onOpenInstanceMenu = { inst ->
                         vm.selectInstance(inst.id)
-                        destination = MainDestination.SETTINGS
+                        vm.measureInstance(inst)
+                        actionTarget = inst
                     },
                     onOpenAccount = { destination = MainDestination.ACCOUNT },
                     modifier = modifier
@@ -437,6 +454,24 @@ private fun AppContent(darkMode: Boolean?, onThemeChange: (Boolean?) -> Unit) {
             )
         }
 
+        // 实例操作：改名 / 打开目录 / 删除
+        actionTarget?.let { inst ->
+            InstanceActionSheet(
+                instance = inst,
+                sizeBytes = instanceSizes[inst.id],
+                onRename = { vm.renameInstance(inst, it) },
+                onDelete = {
+                    vm.deleteInstance(inst)
+                    actionTarget = null
+                },
+                onOpenFolder = {
+                    actionTarget = null
+                    openFolder(context, vm.gameDirOf(inst))
+                },
+                onDismiss = { actionTarget = null }
+            )
+        }
+
         // 补全运行依赖：首启 / 升级后 / 点启动被拦下时出现
         if (bundlePending.isNotEmpty() && !setupDismissed) {
             SetupDialog(
@@ -558,6 +593,32 @@ private fun ControlEditorFullscreen(
                 .align(Alignment.BottomStart)
                 .padding(16.dp)
         ) { Text("恢复默认布局") }
+    }
+}
+
+/**
+ * 用系统文件管理器打开应用私有目录。
+ *
+ * Android 11+ 不允许随便把 `file://` 分享给别的 App，这里走 DocumentsProvider 暴露的
+ * 目录 URI。若系统文件管理器不支持，退化成提示路径 —— 总比静默失败好。
+ */
+private fun openFolder(context: android.content.Context, dir: java.io.File) {
+    runCatching {
+        dir.mkdirs()
+        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+            setDataAndType(
+                android.net.Uri.parse("content://com.android.externalstorage.documents/root/primary"),
+                "vnd.android.document/root"
+            )
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }.onFailure {
+        android.widget.Toast.makeText(
+            context,
+            "目录：${dir.absolutePath}",
+            android.widget.Toast.LENGTH_LONG
+        ).show()
     }
 }
 

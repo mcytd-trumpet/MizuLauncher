@@ -86,6 +86,46 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
     val selectedInstance: InstanceMeta?
         get() = _instances.value.firstOrNull { it.id == _selectedId.value }
 
+    /** 实例占用空间（字节）；统计要遍历目录，放到 IO 线程算 */
+    private val _instanceSizes = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val instanceSizes: StateFlow<Map<String, Long>> = _instanceSizes.asStateFlow()
+
+    fun measureInstance(meta: InstanceMeta) {
+        if (_instanceSizes.value.containsKey(meta.id)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val size = runCatching { container.instanceManager.sizeOf(meta) }.getOrDefault(0L)
+            _instanceSizes.value = _instanceSizes.value + (meta.id to size)
+        }
+    }
+
+    /** 重命名实例。空白名直接忽略，避免主页出现一张没有标题的卡片 */
+    fun renameInstance(meta: InstanceMeta, newName: String) {
+        val trimmed = newName.trim()
+        if (trimmed.isEmpty() || trimmed == meta.name) return
+        runCatching {
+            container.instanceManager.update(meta.copy(name = trimmed))
+            refreshInstances()
+        }.onFailure { _error.value = "重命名失败：${it.message}" }
+    }
+
+    /**
+     * 删除实例。
+     *
+     * 默认连文件一起删——PCL2 也是这个行为，但必须让用户确认，
+     * 因为一个实例的 libraries + assets 动辄几个 GB，删错了没法恢复。
+     */
+    fun deleteInstance(meta: InstanceMeta) {
+        runCatching {
+            container.instanceManager.delete(meta.id, deleteFiles = true)
+            _instanceSizes.value = _instanceSizes.value - meta.id
+            refreshInstances()
+            _bundleNotice.value = "已删除实例「${meta.name.ifBlank { meta.versionId }}」"
+        }.onFailure { _error.value = "删除失败：${it.message}" }
+    }
+
+    /** 实例的游戏目录（用于「打开文件夹」） */
+    fun gameDirOf(meta: InstanceMeta): File = container.instanceManager.gameDirOf(meta)
+
     // ---------------- 版本清单 ----------------
 
     private val _versions = MutableStateFlow<List<VersionEntry>>(emptyList())
@@ -161,6 +201,7 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
     val bundlePending: StateFlow<List<BundleCatalog.Item>> = bundleInstaller.pending
     val bundleStates: StateFlow<Map<String, BundleInstaller.ItemState>> = bundleInstaller.states
     val bundlePhase: StateFlow<BundleInstaller.Phase> = bundleInstaller.phase
+    val bundleScanned: StateFlow<Boolean> = bundleInstaller.scanned
 
     private val _setupDismissed = MutableStateFlow(false)
 
@@ -260,6 +301,11 @@ class LauncherViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun launch(meta: InstanceMeta) {
         if (_installing.value) return
+        if (!bundleInstaller.scanned.value) {
+            // 首启扫描还没结束，先别放行，否则会绕过依赖检查
+            _bundleNotice.value = "正在检查运行依赖，请稍候…"
+            return
+        }
         if (bundleInstaller.pending.value.isNotEmpty()) {
             // 把补全弹窗重新叫出来（用户可能点过「稍后」）
             _setupDismissed.value = false
