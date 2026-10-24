@@ -134,6 +134,43 @@ jobs:
             --manifest .jre-cache/jre-index.json
           du -sh app/src/main/assets/runtime/* 2>/dev/null || true
 
+      # 签名：从 Secrets 还原 keystore。
+      #
+      # 之前这里缺了一大块——app/build.gradle.kts 只在 mizu.storeFile 存在时才启用
+      # signingConfig，而 CI 从没把 keystore 放到位，于是每次产出的都是
+      # app-*-release-unsigned.apk：能编译、能上传、能发 Release，但**装不上**，
+      # Android 直接报「未签名」。光看 CI 绿是发现不了的。
+      #
+      # 没配 Secrets 时不能失败（fork 的 PR 拿不到 secrets），
+      # 所以走「跳过并留警告」，产物仍是未签名包。
+      - name: 还原签名密钥
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${KEYSTORE_B64:-}" ]]; then
+            echo "::warning::未配置 ANDROID_KEYSTORE_BASE64，产物将是未签名包（无法安装）"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 放仓库外，别落在工作区里被 artifact 收走
+          mkdir -p "$RUNNER_TEMP/ks"
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/ks/release.jks"
+          # gradle.properties 里配的是相对路径时按仓库根解析，
+          # 这里写绝对路径最不容易出错
+          {
+            echo "mizu.storeFile=$RUNNER_TEMP/ks/release.jks"
+            echo "mizu.storePassword=$STORE_PASSWORD"
+            echo "mizu.keyAlias=$KEY_ALIAS"
+            echo "mizu.keyPassword=$KEY_PASSWORD"
+          } >> gradle.properties
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "✓ 已注入签名配置"
+
       - name: 编译五个 ABI 变体
         env:
           VNAME: ${{ needs.version.outputs.name }}
@@ -169,6 +206,44 @@ jobs:
             cp "$src" "artifacts/MizuLauncher-${name}-${code}-${abi}.apk"
           done
           ls -lh artifacts
+
+      # 签名自检：宁可让 CI 红，也别再发一堆装不上的包出去。
+      #
+      # 检查 APK Signing Block 魔数 "APK Sig Block 42"（v2/v3 签名）。
+      # 用 Python 直接读文件，不依赖 zipalign/apksigner 在 PATH 里。
+      # 签名没配时这里放行（已经 warning 过），配了就必须签上。
+      - name: 校验产物已签名
+        env:
+          SIGNING_ENABLED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import glob, sys
+
+          files = sorted(glob.glob("artifacts/*.apk"))
+          if not files:
+              sys.exit("没有产物")
+
+          unsigned = []
+          for f in files:
+              blob = open(f, "rb").read()
+              # 未签名包的 Gradle 输出名带 -unsigned，双重判据更稳
+              has_block = b"APK Sig Block 42" in blob
+              if not has_block or "-unsigned" in f:
+                  unsigned.append(f)
+
+          if unsigned:
+              print("以下产物未签名：")
+              for f in unsigned:
+                  print("  " + f)
+              print(f"签名开关: {__import__('os').environ.get('SIGNING_ENABLED')}")
+              # 明文提示怎么修，下次别再来翻日志
+              print("\n修法：在仓库 Settings → Secrets 里配")
+              print("  ANDROID_KEYSTORE_BASE64   keystore 文件的 base64")
+              print("  ANDROID_STORE_PASSWORD / ANDROID_KEY_ALIAS / ANDROID_KEY_PASSWORD")
+          else:
+              print(f"✓ {len(files)} 个产物均已签名")
+          EOF
 
       - uses: actions/upload-artifact@v4
         with:
